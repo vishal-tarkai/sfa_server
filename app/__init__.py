@@ -1,0 +1,1 @@
+"""SPINE SFA FastAPI application."""
