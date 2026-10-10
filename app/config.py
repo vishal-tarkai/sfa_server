@@ -1,4 +1,10 @@
-"""Loads CMS/.env without printing secret values."""
+"""Load env from the first existing file (no secret logging).
+
+Search order (SFA_v2 monorepo or sfa_server clone):
+  1) CMS/.env
+  2) repo-root .env
+  3) server/.env  (this repo root when deployed standalone)
+"""
 
 from __future__ import annotations
 
@@ -6,10 +12,11 @@ import os
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+MONO = ROOT.parent
 ENV_CANDIDATES = (
+    MONO / "CMS" / ".env",
+    MONO / ".env",
     ROOT / ".env",
-    ROOT.parent / "CMS" / ".env",
-    ROOT / "CMS" / ".env",
 )
 ENV_PATH = next((path for path in ENV_CANDIDATES if path.exists()), ENV_CANDIDATES[0])
 

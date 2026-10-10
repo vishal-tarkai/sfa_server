@@ -108,13 +108,18 @@ async def swagger_ui() -> object:
 async def health(request: Request) -> dict:
     db = getattr(request.app.state, "db", None)
     configured = db.configured if db is not None else False
+    data: dict = {
+        "configured": configured,
+        "docs": "/docs",
+        "swagger": "/swagger",
+        "redoc": "/redoc",
+    }
+    if not configured:
+        data["setup_hint"] = (
+            "Add SUPABASE_URL and SUPABASE_ANON_KEY in Render → Environment, then redeploy."
+        )
     return {
         "success": True,
         "message": "OK",
-        "data": {
-            "configured": configured,
-            "docs": "/docs",
-            "swagger": "/swagger",
-            "redoc": "/redoc",
-        },
+        "data": data,
     }

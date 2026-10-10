@@ -39,7 +39,8 @@ class DB:
         if not self.configured:
             raise APIError(
                 503,
-                "Supabase is not configured. Set SUPABASE_URL and SUPABASE_ANON_KEY in CMS/.env.",
+                "Supabase is not configured. Set SUPABASE_URL and SUPABASE_ANON_KEY "
+                "(Render: service → Environment; local: copy .env.example to .env).",
                 "SERVICE_UNAVAILABLE",
             )
 
