@@ -9,7 +9,14 @@ services:
     envVars:
       - key: PYTHON_VERSION
         value: "3.12.8"
+      # Set values in Render Dashboard → Environment (required for login/API).
       - key: SUPABASE_URL
         sync: false
       - key: SUPABASE_ANON_KEY
         sync: false
+      - key: ATTENDANCE_OFFICE_LAT
+        value: "30.512355"
+      - key: ATTENDANCE_OFFICE_LNG
+        value: "76.807612"
+      - key: ATTENDANCE_OFFICE_RADIUS_METERS
+        value: "200"

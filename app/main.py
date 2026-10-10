@@ -15,6 +15,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.docs import get_swagger_ui_html
 from fastapi.responses import JSONResponse, RedirectResponse
 
+import os
+
+from app.config import SUPABASE_ANON_KEY, SUPABASE_URL
 from app.db import create_db
 from app.errors import APIError, fail_body
 from app.routers.admin import router as admin_router
@@ -115,9 +118,18 @@ async def health(request: Request) -> dict:
         "redoc": "/redoc",
     }
     if not configured:
+        url_set = bool(SUPABASE_URL)
+        key_set = bool(SUPABASE_ANON_KEY)
+        data["env_check"] = {
+            "SUPABASE_URL_set": url_set,
+            "SUPABASE_ANON_KEY_set": key_set,
+        }
         data["setup_hint"] = (
-            "Add SUPABASE_URL and SUPABASE_ANON_KEY in Render → Environment, then redeploy."
+            "Render Dashboard → your web service → Environment → add SUPABASE_URL and "
+            "SUPABASE_ANON_KEY → Save (triggers redeploy). Do not rely on git .env."
         )
+        if os.environ.get("RENDER"):
+            data["render_service"] = os.environ.get("RENDER_SERVICE_NAME", "")
     return {
         "success": True,
         "message": "OK",

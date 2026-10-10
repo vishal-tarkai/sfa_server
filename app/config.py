@@ -34,10 +34,24 @@ def load_env(path: Path = ENV_PATH) -> None:
         os.environ.setdefault(key, value)
 
 
-load_env()
+def _first_env(*names: str) -> str:
+    for name in names:
+        value = os.environ.get(name, "").strip()
+        if value:
+            return value
+    return ""
 
-SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
-SUPABASE_ANON_KEY = os.environ.get("SUPABASE_ANON_KEY", "")
+
+for _path in (
+    *ENV_CANDIDATES,
+    Path("/etc/secrets/.env"),
+    Path("/etc/secrets/env"),
+):
+    if _path.exists():
+        load_env(_path)
+
+SUPABASE_URL = _first_env("SUPABASE_URL").rstrip("/")
+SUPABASE_ANON_KEY = _first_env("SUPABASE_ANON_KEY", "SUPABASE_KEY", "SUPABASE_ANON")
 HOST = os.environ.get("HOST", "127.0.0.1")
 PORT = int(os.environ.get("PORT", "8080"))
 
