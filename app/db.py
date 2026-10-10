@@ -83,12 +83,14 @@ class DB:
     ) -> list[dict]:
         self._ensure()
         params: dict[str, str] = {"select": select}
+        _ops = ("eq.", "neq.", "gt.", "gte.", "lt.", "lte.", "like.", "ilike.", "in.", "is.")
         for key, value in (filters or {}).items():
             if value is None:
                 continue
-            params[key] = value if isinstance(value, str) and "." in str(value)[:8] else f"eq.{value}"
-            if isinstance(value, str) and any(value.startswith(op) for op in ("eq.", "neq.", "gt.", "gte.", "lt.", "lte.", "like.", "ilike.", "in.", "is.")):
+            if isinstance(value, str) and any(value.startswith(op) for op in _ops):
                 params[key] = value
+            else:
+                params[key] = f"eq.{value}"
         if order:
             params["order"] = order
         if limit is not None:

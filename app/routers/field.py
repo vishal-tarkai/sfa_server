@@ -771,6 +771,8 @@ async def list_entities(
     limit: int = 20,
     entity_id: str | None = None,
 ):
+    if entity_id:
+        return await get_entity(entity_id, user, db)
     del user
     rows = await db.select("healthcare_entities", order="name.asc")
     names = {row.get("entity_id"): row.get("name") for row in rows}
@@ -1066,13 +1068,14 @@ async def dpr_approval_detail(dpr_id: str, user: dict = Depends(field_user), db:
 @router.get("/dpr/{dpr_id}")
 async def my_dpr_detail(dpr_id: str, user: dict = Depends(field_user), db: DB = Depends(get_db)):
     detail = await _dpr_detail(db, dpr_id)
-    if detail.get("employee", {}).get("employee_id") not in (user["employee_id"], None):
-        me = await _user_row(db, user["employee_id"])
-        owner = (detail.get("employee") or {}).get("employee_id")
-        people = await db.select("users", filters={"employee_id": owner}, limit=1)
-        manager = ((people[0].get("manager") if people else "") or "").strip().lower()
-        if manager != (me.get("name") or "").strip().lower() and owner != user["employee_id"]:
-            raise APIError(403, "You cannot view this DPR", "FORBIDDEN")
+    owner = (detail.get("employee") or {}).get("employee_id")
+    if owner == user["employee_id"]:
+        return respond("OK", detail)
+    me = await _user_row(db, user["employee_id"])
+    people = await db.select("users", filters={"employee_id": owner}, limit=1) if owner else []
+    manager = ((people[0].get("manager") if people else "") or "").strip().lower()
+    if manager != (me.get("name") or "").strip().lower():
+        raise APIError(403, "You cannot view this DPR", "FORBIDDEN")
     return respond("OK", detail)
 
 

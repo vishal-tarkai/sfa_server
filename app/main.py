@@ -61,7 +61,7 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -106,12 +106,13 @@ async def swagger_ui() -> object:
 
 @app.get("/v1/health", tags=["meta"])
 async def health(request: Request) -> dict:
-    db = request.app.state.db
+    db = getattr(request.app.state, "db", None)
+    configured = db.configured if db is not None else False
     return {
         "success": True,
         "message": "OK",
         "data": {
-            "configured": db.configured,
+            "configured": configured,
             "docs": "/docs",
             "swagger": "/swagger",
             "redoc": "/redoc",

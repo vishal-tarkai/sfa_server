@@ -5,11 +5,11 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(__file__).resolve().parents[1]
 ENV_CANDIDATES = (
-    ROOT / "CMS" / ".env",
     ROOT / ".env",
-    Path(__file__).resolve().parents[1] / ".env",
+    ROOT.parent / "CMS" / ".env",
+    ROOT / "CMS" / ".env",
 )
 ENV_PATH = next((path for path in ENV_CANDIDATES if path.exists()), ENV_CANDIDATES[0])
 
