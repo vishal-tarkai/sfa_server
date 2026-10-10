@@ -8,7 +8,7 @@ from typing import Any
 from fastapi import Depends
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
-from app.config import TOKEN_TTL_SECONDS
+from app.config import ADMIN_EMAIL, TOKEN_TTL_SECONDS
 from app.errors import APIError
 
 bearer_scheme = HTTPBearer(
@@ -39,6 +39,66 @@ def drop_token(token: str | None) -> None:
         SESSIONS.pop(token, None)
 
 
+def _parse_field_token(token: str) -> tuple[str, float] | None:
+    """`cms_{employee_id}_{issued_ms}` — survives server restarts (e.g. Render)."""
+    if not token.startswith("cms_"):
+        return None
+    parts = token.split("_")
+    if len(parts) < 3:
+        return None
+    try:
+        issued_ms = int(parts[-1])
+    except ValueError:
+        return None
+    employee_id = "_".join(parts[1:-1]).strip()
+    if not employee_id:
+        return None
+    return employee_id, issued_ms / 1000.0
+
+
+def _parse_admin_token(token: str) -> float | None:
+    if not token.startswith("admin_"):
+        return None
+    suffix = token.removeprefix("admin_")
+    try:
+        issued_ms = int(suffix)
+    except ValueError:
+        return None
+    return issued_ms / 1000.0
+
+
+def _restore_session_from_token(token: str, role: str) -> dict[str, Any] | None:
+    now = time.time()
+    if role == "field":
+        parsed = _parse_field_token(token)
+        if not parsed:
+            return None
+        employee_id, issued_at = parsed
+        exp = issued_at + TOKEN_TTL_SECONDS
+        if exp < now:
+            return None
+        return {
+            "role": "field",
+            "exp": exp,
+            "token": token,
+            "employee_id": employee_id,
+        }
+    if role == "admin":
+        issued_at = _parse_admin_token(token)
+        if issued_at is None:
+            return None
+        exp = issued_at + TOKEN_TTL_SECONDS
+        if exp < now:
+            return None
+        return {
+            "role": "admin",
+            "exp": exp,
+            "token": token,
+            "email": ADMIN_EMAIL,
+        }
+    return None
+
+
 def _bearer(authorization: str | None) -> str:
     if not authorization or not authorization.lower().startswith("bearer "):
         raise APIError(401, "Session expired. Please login again", "UNAUTHORIZED")
@@ -51,10 +111,20 @@ def _bearer(authorization: str | None) -> str:
 def _session(authorization: str | None, role: str) -> dict[str, Any]:
     token = _bearer(authorization)
     session = SESSIONS.get(token)
-    if session is None or session.get("role") != role or session.get("exp", 0) < time.time():
-        SESSIONS.pop(token, None)
-        raise APIError(401, "Session expired. Please login again", "UNAUTHORIZED")
-    return session
+    if (
+        session is not None
+        and session.get("role") == role
+        and session.get("exp", 0) >= time.time()
+    ):
+        return session
+
+    restored = _restore_session_from_token(token, role)
+    if restored is not None:
+        SESSIONS[token] = restored
+        return restored
+
+    SESSIONS.pop(token, None)
+    raise APIError(401, "Session expired. Please login again", "UNAUTHORIZED")
 
 
 def _authorization_header(
