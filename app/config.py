@@ -13,6 +13,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 MONO = ROOT.parent
+PUBLIC_SUPABASE_ENV = ROOT / "supabase.public.env"
 ENV_CANDIDATES = (
     MONO / "CMS" / ".env",
     MONO / ".env",
@@ -43,7 +44,9 @@ def _first_env(*names: str) -> str:
 
 
 def reload_env_files() -> None:
+    # Process env (Render) wins; files fill gaps via setdefault in load_env.
     for path in (
+        PUBLIC_SUPABASE_ENV,
         *ENV_CANDIDATES,
         Path("/etc/secrets/.env"),
         Path("/etc/secrets/env"),
