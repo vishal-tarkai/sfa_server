@@ -71,6 +71,17 @@ OFFICE_LAT = float(os.environ.get("ATTENDANCE_OFFICE_LAT", "30.512355"))
 OFFICE_LNG = float(os.environ.get("ATTENDANCE_OFFICE_LNG", "76.807612"))
 OFFICE_RADIUS_M = float(os.environ.get("ATTENDANCE_OFFICE_RADIUS_METERS", "500"))
 
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name, "").strip().lower()
+    if not raw:
+        return default
+    return raw in ("1", "true", "yes", "on")
+
+
+# Temporary: skip geofence + serve env Head Office coords to the app (see supabase.public.env).
+ATTENDANCE_SKIP_GEOFENCE = _env_bool("ATTENDANCE_SKIP_GEOFENCE", True)
+
 FIELD_DEFAULT_PASSWORD = "1234"
 ADMIN_EMAIL = "vishal@tarkai.com"
 ADMIN_PASSWORD = "1234"

@@ -9,6 +9,7 @@ from fastapi import APIRouter, Body, Depends, File, Query, UploadFile
 
 from app.auth import drop_token, field_user, issue_token
 from app.config import (
+    ATTENDANCE_SKIP_GEOFENCE,
     EXTENDED_MINUTES,
     FIELD_DEFAULT_PASSWORD,
     MIN_CHECKOUT_MINUTES,
@@ -52,7 +53,19 @@ async def _user_row(db: DB, employee_id: str) -> dict:
     return rows[0]
 
 
+def _env_head_office() -> dict:
+    return {
+        "id": "env",
+        "name": "Head Office",
+        "latitude": OFFICE_LAT,
+        "longitude": OFFICE_LNG,
+        "radius_m": OFFICE_RADIUS_M,
+    }
+
+
 async def _offices(db: DB) -> list[dict]:
+    if ATTENDANCE_SKIP_GEOFENCE:
+        return [_env_head_office()]
     try:
         rows = await db.select("head_offices", filters={"status": "active"})
     except APIError:
@@ -67,17 +80,13 @@ async def _offices(db: DB) -> list[dict]:
             "radius_m": num(row.get("radius_meters")) or OFFICE_RADIUS_M,
         })
     if not offices:
-        offices.append({
-            "id": "env",
-            "name": "Head Office",
-            "latitude": OFFICE_LAT,
-            "longitude": OFFICE_LNG,
-            "radius_m": OFFICE_RADIUS_M,
-        })
+        offices.append(_env_head_office())
     return offices
 
 
 def _inside_office(lat: float, lng: float, offices: list[dict]) -> bool:
+    if ATTENDANCE_SKIP_GEOFENCE:
+        return True
     for office in offices:
         if haversine_m(lat, lng, office["latitude"], office["longitude"]) <= office["radius_m"]:
             return True
