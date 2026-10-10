@@ -17,7 +17,7 @@ from fastapi.responses import JSONResponse, RedirectResponse
 
 import os
 
-from app.config import SUPABASE_ANON_KEY, SUPABASE_URL
+from app.config import supabase_credentials
 from app.db import create_db
 from app.errors import APIError, fail_body
 from app.routers.admin import router as admin_router
@@ -118,12 +118,14 @@ async def health(request: Request) -> dict:
         "redoc": "/redoc",
     }
     if not configured:
-        url_set = bool(SUPABASE_URL)
-        key_set = bool(SUPABASE_ANON_KEY)
+        url, key = supabase_credentials()
         data["env_check"] = {
-            "SUPABASE_URL_set": url_set,
-            "SUPABASE_ANON_KEY_set": key_set,
+            "SUPABASE_URL_set": bool(url),
+            "SUPABASE_ANON_KEY_set": bool(key),
         }
+        related = sorted(k for k in os.environ if "SUPABASE" in k.upper())
+        if related:
+            data["env_check"]["supabase_keys_seen"] = related
         data["setup_hint"] = (
             "Render Dashboard → your web service → Environment → add SUPABASE_URL and "
             "SUPABASE_ANON_KEY → Save (triggers redeploy). Do not rely on git .env."

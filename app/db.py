@@ -8,7 +8,7 @@ from urllib.parse import quote
 
 import httpx
 
-from app.config import SUPABASE_ANON_KEY, SUPABASE_URL
+from app.config import supabase_credentials
 from app.errors import APIError
 
 
@@ -215,4 +215,5 @@ class DB:
 
 
 def create_db() -> DB:
-    return DB(SUPABASE_URL, SUPABASE_ANON_KEY)
+    url, key = supabase_credentials()
+    return DB(url, key)

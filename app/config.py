@@ -42,16 +42,25 @@ def _first_env(*names: str) -> str:
     return ""
 
 
-for _path in (
-    *ENV_CANDIDATES,
-    Path("/etc/secrets/.env"),
-    Path("/etc/secrets/env"),
-):
-    if _path.exists():
-        load_env(_path)
+def reload_env_files() -> None:
+    for path in (
+        *ENV_CANDIDATES,
+        Path("/etc/secrets/.env"),
+        Path("/etc/secrets/env"),
+    ):
+        if path.exists():
+            load_env(path)
 
-SUPABASE_URL = _first_env("SUPABASE_URL").rstrip("/")
-SUPABASE_ANON_KEY = _first_env("SUPABASE_ANON_KEY", "SUPABASE_KEY", "SUPABASE_ANON")
+
+def supabase_credentials() -> tuple[str, str]:
+    """Read Supabase settings from process env (Render injects before startup)."""
+    url = _first_env("SUPABASE_URL").rstrip("/")
+    key = _first_env("SUPABASE_ANON_KEY", "SUPABASE_KEY", "SUPABASE_ANON")
+    return url, key
+
+
+reload_env_files()
+SUPABASE_URL, SUPABASE_ANON_KEY = supabase_credentials()
 HOST = os.environ.get("HOST", "127.0.0.1")
 PORT = int(os.environ.get("PORT", "8080"))
 
