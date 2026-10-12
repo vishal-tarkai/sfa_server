@@ -176,12 +176,105 @@ def period_sort_key(label: str) -> tuple[int, int]:
     return (year, month)
 
 
+def coerce_text_list(value: Any) -> list[str]:
+    """PostgREST may return TEXT[] as JSON list, PG array string, or JSON-encoded string."""
+    if value is None:
+        return []
+    if isinstance(value, list):
+        out: list[str] = []
+        for item in value:
+            if item is None:
+                continue
+            if isinstance(item, dict):
+                name = (item.get("name") or item.get("product_name") or "").strip()
+                if name:
+                    out.append(name)
+                continue
+            text = str(item).strip()
+            if text:
+                out.append(text)
+        return out
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return []
+        if raw.startswith("[") and raw.endswith("]"):
+            try:
+                import json
+
+                parsed = json.loads(raw)
+                if isinstance(parsed, list):
+                    return coerce_text_list(parsed)
+            except Exception:
+                pass
+        if raw.startswith("{") and raw.endswith("}"):
+            inner = raw[1:-1].strip()
+            if not inner:
+                return []
+            parts: list[str] = []
+            for chunk in inner.split(","):
+                piece = chunk.strip().strip('"').strip("'")
+                if piece:
+                    parts.append(piece)
+            return parts
+        return [raw]
+    return []
+
+
+def coerce_json_object(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return dict(value)
+    if isinstance(value, str):
+        try:
+            import json
+
+            parsed = json.loads(value)
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            return {}
+    return {}
+
+
+def normalize_sales_target_row(row: dict | None) -> dict | None:
+    if not row:
+        return None
+    out = dict(row)
+    out["products"] = coerce_text_list(out.get("products"))
+    out["product_breakdown"] = coerce_json_object(out.get("product_breakdown"))
+    period = out.get("period")
+    if isinstance(period, str):
+        out["period"] = " ".join(period.split())
+    return out
+
+
+def normalize_period_label(label: str) -> str:
+    return " ".join((label or "").split())
+
+
+def periods_match(a: str, b: str) -> bool:
+    return normalize_period_label(a).lower() == normalize_period_label(b).lower()
+
+
+def normalize_sales_target_rows(rows: list[dict]) -> list[dict]:
+    normalized: list[dict] = []
+    for row in rows:
+        fixed = normalize_sales_target_row(row)
+        if fixed:
+            normalized.append(fixed)
+    return normalized
+
+
 def pick_sales_target_row(rows: list[dict], period: str) -> tuple[dict | None, str]:
     """Prefer the requested period when it has products; else latest period with products."""
+    period = normalize_period_label(period or period_label())
     if not rows:
         return None, period
 
-    current = next((row for row in rows if row.get("period") == period), None)
+    current = next(
+        (row for row in rows if periods_match(row.get("period") or "", period)),
+        None,
+    )
     if current is not None and sales_target_product_items(current):
         return current, period
 

@@ -29,6 +29,8 @@ from app.util import (
     entity_visible_for_territory,
     haversine_m,
     norm_entity_type,
+    normalize_sales_target_row,
+    normalize_sales_target_rows,
     pick_sales_target_row,
     product_name_matches_assignment,
     sales_target_product_items,
@@ -501,8 +503,12 @@ async def celebrations(user: dict = Depends(field_user), db: DB = Depends(get_db
 async def sales_targets(user: dict = Depends(field_user), db: DB = Depends(get_db), period: str = Query(default="")):
     employee_id = user["employee_id"]
     period = period or period_label()
-    rows = await db.select("sales_targets", filters={"employee_id": employee_id})
+    rows = normalize_sales_target_rows(
+        await db.select("sales_targets", filters={"employee_id": employee_id})
+    )
     current, period = pick_sales_target_row(rows, period)
+    if current is not None:
+        current = normalize_sales_target_row(current) or current
     target_amount = int(num(current.get("target_amount"))) if current else 0
     orders = await db.select("pob_orders", filters={"employee_id": employee_id})
     counted = [row for row in orders if row.get("status") in ("submitted", "approved")]
@@ -1493,8 +1499,12 @@ async def order_detail(order_id: str, user: dict = Depends(field_user), db: DB =
 @router.get("/products/assigned")
 async def assigned_products(user: dict = Depends(field_user), db: DB = Depends(get_db), period: str = ""):
     period = period or period_label()
-    target_rows = await db.select("sales_targets", filters={"employee_id": user["employee_id"]})
+    target_rows = normalize_sales_target_rows(
+        await db.select("sales_targets", filters={"employee_id": user["employee_id"]})
+    )
     target, period = pick_sales_target_row(target_rows, period)
+    if target is not None:
+        target = normalize_sales_target_row(target) or target
     assigned_names = [item["name"] for item in sales_target_product_items(target)]
     rows = await db.select("products", filters={"status": "active"}, order="name.asc")
     if not assigned_names:
