@@ -26,7 +26,12 @@ from app.util import (
     as_date,
     clock_label,
     entity_card,
+    entity_visible_for_territory,
     haversine_m,
+    norm_entity_type,
+    pick_sales_target_row,
+    product_name_matches_assignment,
+    sales_target_product_items,
     in_month,
     login_user,
     month_bounds,
@@ -497,11 +502,7 @@ async def sales_targets(user: dict = Depends(field_user), db: DB = Depends(get_d
     employee_id = user["employee_id"]
     period = period or period_label()
     rows = await db.select("sales_targets", filters={"employee_id": employee_id})
-    current = next((row for row in rows if row.get("period") == period), None)
-    if current is None and rows:
-        published = [row for row in rows if row.get("status") == "published"]
-        current = published[-1] if published else rows[-1]
-        period = current.get("period") or period
+    current, period = pick_sales_target_row(rows, period)
     target_amount = int(num(current.get("target_amount"))) if current else 0
     orders = await db.select("pob_orders", filters={"employee_id": employee_id})
     counted = [row for row in orders if row.get("status") in ("submitted", "approved")]
@@ -516,15 +517,10 @@ async def sales_targets(user: dict = Depends(field_user), db: DB = Depends(get_d
         return int(sum(num(row.get("total_amount")) for row in counted if in_month(row.get("created_at"), start, end)))
 
     achieved = achieved_for(period)
-    products = []
-    for item in (current or {}).get("products") or []:
-        if isinstance(item, dict):
-            products.append({
-                "name": item.get("name") or item.get("product_name") or "",
-                "target_inr": int(num(item.get("target_amount") or item.get("target_inr"))),
-                "achieved_inr": int(num(item.get("achieved_amount") or item.get("achieved_inr"))),
-                "achievement_percent": int(num(item.get("achievement_percent"))),
-            })
+    products = sales_target_product_items(current)
+    breakdown = (current or {}).get("product_breakdown") or {}
+    if not isinstance(breakdown, dict):
+        breakdown = {}
     chart = []
     anchor = date.today()
     for offset in range(4, -1, -1):
@@ -562,6 +558,7 @@ async def sales_targets(user: dict = Depends(field_user), db: DB = Depends(get_d
         },
         "monthly_chart": chart,
         "products": products,
+        "product_breakdown": breakdown,
     })
 
 
@@ -782,14 +779,20 @@ async def list_entities(
 ):
     if entity_id:
         return await get_entity(entity_id, user, db)
-    del user
+    employee_id = user.get("employee_id") or ""
     rows = await db.select("healthcare_entities", order="name.asc")
     names = {row.get("entity_id"): row.get("name") for row in rows}
     items = []
+    want_type = norm_entity_type(type) if type else ""
     for row in rows:
-        if territory and (row.get("territory") or "") != territory:
+        if not entity_visible_for_territory(
+            row.get("territory"),
+            territory,
+            employee_id=employee_id,
+            assigned_employee_id=row.get("assigned_employee_id"),
+        ):
             continue
-        if type and (row.get("type") or "") != type:
+        if want_type and norm_entity_type(row.get("type")) != want_type:
             continue
         if q and q.lower() not in (row.get("name") or "").lower():
             continue
@@ -1490,13 +1493,25 @@ async def order_detail(order_id: str, user: dict = Depends(field_user), db: DB =
 @router.get("/products/assigned")
 async def assigned_products(user: dict = Depends(field_user), db: DB = Depends(get_db), period: str = ""):
     period = period or period_label()
-    targets = await db.select("sales_targets", filters={"employee_id": user["employee_id"], "period": period}, limit=1)
-    wanted = set()
-    for item in (targets[0].get("products") if targets else []) or []:
-        if isinstance(item, dict):
-            wanted.add(item.get("product_id") or item.get("name"))
+    target_rows = await db.select("sales_targets", filters={"employee_id": user["employee_id"]})
+    target, period = pick_sales_target_row(target_rows, period)
+    assigned_names = [item["name"] for item in sales_target_product_items(target)]
     rows = await db.select("products", filters={"status": "active"}, order="name.asc")
-    items = [product_card(row) for row in rows if not wanted or row.get("product_id") in wanted or row.get("name") in wanted]
+    if not assigned_names:
+        items = []
+    else:
+        items = []
+        used_ids: set[str] = set()
+        for assigned in assigned_names:
+            for row in rows:
+                pid = row.get("product_id") or ""
+                if pid and pid in used_ids:
+                    continue
+                if product_name_matches_assignment(row.get("name") or "", assigned):
+                    items.append(product_card(row))
+                    if pid:
+                        used_ids.add(pid)
+                    break
     page_items, meta = paginate(items, 1, 100)
     return respond("OK", {"total_records": len(items), "items": page_items, "pagination": meta})
 

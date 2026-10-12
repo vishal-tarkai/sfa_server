@@ -136,16 +136,112 @@ def profile_user(row: dict, target_percent: int = 0) -> dict:
     }
 
 
+def norm_entity_type(value: str | None) -> str:
+    return (value or "").strip().lower()
+
+
+def entity_visible_for_territory(
+    row_territory: str | None,
+    filter_territory: str | None,
+    *,
+    employee_id: str = "",
+    assigned_employee_id: str | None = None,
+) -> bool:
+    """Territory match (case-insensitive) or entity assigned to this MR."""
+    if not filter_territory or not filter_territory.strip():
+        return True
+    row_t = (row_territory or "").strip().casefold()
+    want = filter_territory.strip().casefold()
+    if row_t == want:
+        return True
+    assigned = (assigned_employee_id or "").strip()
+    return bool(assigned and employee_id and assigned == employee_id)
+
+
+def pick_sales_target_row(rows: list[dict], period: str) -> tuple[dict | None, str]:
+    """Current period row, else latest published target."""
+    current = next((row for row in rows if row.get("period") == period), None)
+    if current is not None:
+        return current, period
+    if not rows:
+        return None, period
+    published = [row for row in rows if (row.get("status") or "").lower() == "published"]
+    current = published[-1] if published else rows[-1]
+    return current, (current.get("period") or period)
+
+
+def sales_target_product_items(row: dict | None) -> list[dict]:
+    """`products` may be TEXT[] names or list of product objects."""
+    if not row:
+        return []
+    breakdown = row.get("product_breakdown") or {}
+    if not isinstance(breakdown, dict):
+        breakdown = {}
+    items: list[dict] = []
+    seen: set[str] = set()
+    for entry in row.get("products") or []:
+        if isinstance(entry, dict):
+            name = (entry.get("name") or entry.get("product_name") or "").strip()
+            if not name:
+                continue
+            target = int(num(entry.get("target_amount") or entry.get("target_inr")))
+            achieved = int(num(entry.get("achieved_amount") or entry.get("achieved_inr")))
+            pct = int(num(entry.get("achievement_percent")))
+        elif isinstance(entry, str):
+            name = entry.strip()
+            if not name:
+                continue
+            target = int(num(breakdown.get(name)))
+            achieved = 0
+            pct = 0
+        else:
+            continue
+        if name in seen:
+            continue
+        seen.add(name)
+        items.append({
+            "name": name,
+            "target_inr": target,
+            "achieved_inr": achieved,
+            "achievement_percent": pct,
+        })
+    for name, amount in breakdown.items():
+        key = str(name).strip()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        items.append({
+            "name": key,
+            "target_inr": int(num(amount)),
+            "achieved_inr": 0,
+            "achievement_percent": 0,
+        })
+    return items
+
+
+def product_name_matches_assignment(product_name: str, assigned_name: str) -> bool:
+    product = (product_name or "").strip().lower()
+    assigned = (assigned_name or "").strip().lower()
+    if not product or not assigned:
+        return False
+    if product == assigned or assigned in product or product in assigned:
+        return True
+    assigned_first = assigned.split()[0]
+    product_first = product.split()[0]
+    return product.startswith(assigned_first) or assigned.startswith(product_first)
+
+
 def entity_card(row: dict, stockist_name: str = "") -> dict:
     specialty = row.get("specialty") or ""
     hospital = row.get("hospital") or ""
     subtitle = " · ".join(part for part in (specialty, hospital) if part)
+    raw_type = row.get("type") or ""
     return {
         "id": row.get("entity_id") or row.get("id") or "",
         "entity_id": row.get("entity_id") or "",
         "name": row.get("name") or "",
         "subtitle": subtitle,
-        "type": row.get("type") or "",
+        "type": norm_entity_type(raw_type) or raw_type,
         "status": row.get("status") or "active",
         "address": row.get("address") or row.get("city") or "",
         "phone": row.get("phone") or "",

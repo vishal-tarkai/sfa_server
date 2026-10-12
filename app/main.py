@@ -1,6 +1,6 @@
 """SPINE SFA API.
 
-Run from the server directory:
+Run from the sfa_api directory:
 
     .venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8080 --reload
 
