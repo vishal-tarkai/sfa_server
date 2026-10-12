@@ -158,16 +158,48 @@ def entity_visible_for_territory(
     return bool(assigned and employee_id and assigned == employee_id)
 
 
+def period_sort_key(label: str) -> tuple[int, int]:
+    """Sort key for labels like `June 2026` (newest first when reversed)."""
+    parts = (label or "").strip().split()
+    if len(parts) < 2:
+        return (0, 0)
+    try:
+        year = int(parts[-1])
+    except ValueError:
+        year = 0
+    token = parts[0].lower()
+    month = 1
+    for index, name in enumerate(MONTHS, start=1):
+        if name.lower().startswith(token[:3]):
+            month = index
+            break
+    return (year, month)
+
+
 def pick_sales_target_row(rows: list[dict], period: str) -> tuple[dict | None, str]:
-    """Current period row, else latest published target."""
-    current = next((row for row in rows if row.get("period") == period), None)
-    if current is not None:
-        return current, period
+    """Prefer the requested period when it has products; else latest period with products."""
     if not rows:
         return None, period
+
+    current = next((row for row in rows if row.get("period") == period), None)
+    if current is not None and sales_target_product_items(current):
+        return current, period
+
+    with_products = [row for row in rows if sales_target_product_items(row)]
+    if with_products:
+        with_products.sort(
+            key=lambda row: period_sort_key(row.get("period") or ""),
+            reverse=True,
+        )
+        best = with_products[0]
+        return best, (best.get("period") or period)
+
+    if current is not None:
+        return current, period
+
     published = [row for row in rows if (row.get("status") or "").lower() == "published"]
-    current = published[-1] if published else rows[-1]
-    return current, (current.get("period") or period)
+    fallback = published[-1] if published else rows[-1]
+    return fallback, (fallback.get("period") or period)
 
 
 def sales_target_product_items(row: dict | None) -> list[dict]:
