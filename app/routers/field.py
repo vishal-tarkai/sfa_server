@@ -63,6 +63,45 @@ async def _user_row(db: DB, employee_id: str) -> dict:
     return rows[0]
 
 
+def _reporting_manager_from_body(body: dict) -> dict[str, str]:
+    """Selected approver from tour submit (matches leave `forwarded_to` fields)."""
+    manager_id = str(
+        body.get("reporting_manager_id") or body.get("forwarded_to") or ""
+    ).strip()
+    manager_name = str(
+        body.get("reporting_manager_name") or body.get("forwarded_to_name") or ""
+    ).strip()
+    if not manager_id:
+        return {}
+    return {"forwarded_to": manager_id, "forwarded_to_name": manager_name}
+
+
+async def _direct_report_ids(db: DB, manager_employee_id: str) -> set[str]:
+    """Employee IDs whose `users.manager` name matches this manager's display name."""
+    me = await _user_row(db, manager_employee_id)
+    manager_name = (me.get("name") or "").strip().lower()
+    if not manager_name:
+        return set()
+    people = await db.select("users")
+    return {
+        row.get("employee_id")
+        for row in people
+        if row.get("employee_id") != manager_employee_id
+        and (row.get("manager") or "").strip().lower() == manager_name
+    }
+
+
+def _manager_can_see_tour_approval(
+    row: dict,
+    manager_employee_id: str,
+    direct_report_ids: set[str],
+) -> bool:
+    forwarded = str(row.get("forwarded_to") or "").strip()
+    if forwarded:
+        return forwarded == manager_employee_id
+    return row.get("employee_id") in direct_report_ids
+
+
 def _env_head_office() -> dict:
     return {
         "id": "env",
@@ -965,13 +1004,59 @@ async def dpr_seniors(user: dict = Depends(field_user), db: DB = Depends(get_db)
     return respond("OK", {"items": items})
 
 
+def _area_match_labels(area_id: str, nodes: list[dict]) -> set[str]:
+    """Labels used to match healthcare_entities.city / territory to a DPR area."""
+    key = (area_id or "").strip()
+    if not key:
+        return set()
+    by_id = {node.get("node_id"): node for node in nodes if node.get("node_id")}
+    node = by_id.get(key)
+    if not node:
+        return {key.lower()}
+    labels: set[str] = set()
+    for field in ("label", "city_name"):
+        text = (node.get(field) or "").strip().lower()
+        if text:
+            labels.add(text)
+    parent_id = node.get("parent_id")
+    if parent_id and parent_id in by_id:
+        parent_label = (by_id[parent_id].get("label") or "").strip().lower()
+        if parent_label:
+            labels.add(parent_label)
+    return labels
+
+
+def _entity_matches_area(row: dict, area_labels: set[str]) -> bool:
+    if not area_labels:
+        return True
+    city = (row.get("city") or "").strip().lower()
+    territory = (row.get("territory") or "").strip().lower()
+    hospital = (row.get("hospital") or "").strip().lower()
+    for label in area_labels:
+        if not label:
+            continue
+        for field in (city, territory, hospital):
+            if not field:
+                continue
+            if field == label or label in field or field in label:
+                return True
+    return False
+
+
 @router.get("/dpr/doctors/search")
 async def dpr_doctors(user: dict = Depends(field_user), db: DB = Depends(get_db), q: str = "", area_id: str = ""):
-    del user, area_id
+    del user
+    nodes = await _org_nodes(db)
+    area_labels = _area_match_labels(area_id, nodes)
+    q_lower = (q or "").strip().lower()
     rows = await db.select("healthcare_entities", filters={"status": "active"}, order="name.asc")
     items = []
     for row in rows:
-        if q and q.lower() not in (row.get("name") or "").lower() and q.lower() not in (row.get("hospital") or "").lower():
+        if area_labels and not _entity_matches_area(row, area_labels):
+            continue
+        name = (row.get("name") or "").lower()
+        hospital = (row.get("hospital") or "").lower()
+        if q_lower and q_lower not in name and q_lower not in hospital:
             continue
         items.append({
             "id": row.get("entity_id"),
@@ -984,21 +1069,85 @@ async def dpr_doctors(user: dict = Depends(field_user), db: DB = Depends(get_db)
     return respond("OK", {"items": items[:50]})
 
 
+def _dpr_payload_dict(row: dict) -> dict:
+    raw = row.get("payload")
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str) and raw.strip():
+        try:
+            import json
+
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                return parsed
+        except json.JSONDecodeError:
+            pass
+    return {}
+
+
 def _dpr_list_item(row: dict, names: dict[str, dict]) -> dict:
     person = names.get(row.get("employee_id")) or {}
-    payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
+    payload = _dpr_payload_dict(row)
     doctors = payload.get("doctors") or []
     parties = payload.get("parties") or []
+    cme = payload.get("cme_other") or []
+    areas = row.get("selected_areas") or payload.get("selected_areas") or []
+    location = person.get("territory") or ""
+    if isinstance(areas, list) and areas:
+        first = areas[0]
+        if isinstance(first, dict) and (first.get("name") or "").strip():
+            location = first.get("name") or location
     return {
         "dpr_id": row.get("dpr_id"),
         "report_date": as_date(row.get("report_date")),
         "employee_id": row.get("employee_id"),
         "employee_name": person.get("name") or "",
         "territory": person.get("territory") or "",
+        "location": location,
+        "profile_image_url": person.get("profile_image_url") or "",
         "status": row.get("status") or "pending",
-        "visit_count": int(num(row.get("doctor_calls"))) + int(num(row.get("chemist_visits"))) or (len(doctors) + len(parties)),
+        "visit_count": int(num(row.get("doctor_calls")))
+        + int(num(row.get("chemist_visits")))
+        or (len(doctors) + len(parties) + len(cme)),
         "submitted_at": row.get("submitted_time"),
     }
+
+
+def _dpr_field_blocks(body: dict) -> list[dict]:
+    stations = body.get("stations")
+    if isinstance(stations, list) and stations:
+        return [block for block in stations if isinstance(block, dict) and block.get("leg_type") != "return_to_hq"]
+    return []
+
+
+def _dpr_flat_visits(body: dict) -> tuple[list, list, list]:
+    blocks = _dpr_field_blocks(body)
+    if blocks:
+        doctors: list = []
+        parties: list = []
+        cme: list = []
+        for block in blocks:
+            doctors.extend(block.get("doctors") or [])
+            parties.extend(block.get("parties") or [])
+            cme.extend(block.get("cme_other") or [])
+        return doctors, parties, cme
+    return body.get("doctors") or [], body.get("parties") or [], body.get("cme_other") or []
+
+
+def _dpr_field_areas(body: dict) -> list:
+    blocks = _dpr_field_blocks(body)
+    if blocks:
+        areas = []
+        for block in blocks:
+            station = block.get("station")
+            if isinstance(station, dict):
+                areas.append(station)
+        return areas
+    areas = body.get("selected_areas") or []
+    return [
+        area for area in areas
+        if isinstance(area, dict) and (area.get("node_type") or "").lower() != "head_office"
+    ]
 
 
 @router.post("/dpr")
@@ -1008,28 +1157,35 @@ async def submit_dpr(body: dict = Body(...), user: dict = Depends(field_user), d
     report_date = body.get("report_date") or today_str()
     existing = await db.select("dpr_reports", filters={"employee_id": employee_id, "report_date": report_date}, limit=1)
     dpr_id = (existing[0].get("dpr_id") if existing else None) or body.get("dpr_id") or new_id("DPR")
-    doctors = body.get("doctors") or []
-    parties = body.get("parties") or []
-    summary = f"DPR {report_date} — {len(doctors)} doctor(s) — {len(parties)} party visit(s)"
+    doctors, parties, cme_other = _dpr_flat_visits(body)
+    field_areas = _dpr_field_areas(body)
+    summary = (
+        f"DPR {report_date} — {len(doctors)} doctor(s) — {len(parties)} party visit(s)"
+        + (f" — {len(cme_other)} CME/Other" if cme_other else "")
+    )
+    user_block = body.get("user") if isinstance(body.get("user"), dict) else {}
     payload = {
-        "schema_version": "1.0",
+        "schema_version": body.get("schema_version") or "1.1",
         "dpr_id": dpr_id,
         "status": "pending",
         "report_date": report_date,
-        "submitted_at": now_iso(),
+        "submitted_at": body.get("submitted_at") or now_iso(),
         "return_to_hq": bool(body.get("return_to_hq")),
         "user": {
             "employee_id": employee_id,
             "name": person.get("name"),
             "role": person.get("role"),
             "territory": person.get("territory"),
-            "hq": person.get("territory") or "",
+            "hq": user_block.get("hq") or person.get("territory") or "",
             "designation": person.get("designation") or "",
+            "profile_image_url": person.get("profile_image_url") or user_block.get("profile_image_url") or "",
         },
-        "selected_areas": body.get("selected_areas") or [],
+        "stations": body.get("stations") or [],
+        "selected_areas": field_areas,
         "doctors": doctors,
         "parties": parties,
-        "cme_other": body.get("cme_other") or [],
+        "cme_other": cme_other,
+        "metadata": body.get("metadata") or {},
         "joint_working_seniors": body.get("joint_working_seniors") or [],
     }
     row = {
@@ -1042,7 +1198,7 @@ async def submit_dpr(body: dict = Body(...), user: dict = Depends(field_user), d
         "doctor_calls": len(doctors),
         "chemist_visits": len(parties),
         "return_to_hq": bool(body.get("return_to_hq")),
-        "selected_areas": body.get("selected_areas") or [],
+        "selected_areas": field_areas,
         "payload": payload,
     }
     if existing:
@@ -1118,6 +1274,7 @@ async def _dpr_detail(db: DB, dpr_id: str) -> dict:
     row = rows[0]
     names = await _name_map(db)
     person = names.get(row.get("employee_id")) or {}
+    payload = _dpr_payload_dict(row)
     visits = await db.select("dpr_visit_details", filters={"dpr_id": dpr_id}, order="sort_order.asc")
     return {
         "dpr_id": dpr_id,
@@ -1128,8 +1285,10 @@ async def _dpr_detail(db: DB, dpr_id: str) -> dict:
             "name": person.get("name") or "",
             "designation": person.get("designation") or "",
             "territory": person.get("territory") or "",
+            "profile_image_url": person.get("profile_image_url") or "",
+            "role": person.get("role") or "",
         },
-        "areas": row.get("selected_areas") or [],
+        "areas": row.get("selected_areas") or payload.get("selected_areas") or [],
         "visits": [
             {
                 "visit_id": visit.get("visit_id"),
@@ -1140,7 +1299,7 @@ async def _dpr_detail(db: DB, dpr_id: str) -> dict:
             for visit in visits
         ],
         "review_note": row.get("review_note") or "",
-        "payload": row.get("payload"),
+        "payload": payload,
     }
 
 
@@ -1322,6 +1481,7 @@ async def submit_tour(body: dict = Body(...), user: dict = Depends(field_user), 
         "sla": "24h",
         "details": f"Tour plan {saved['plan_date']}",
         "tour_type": "Daily Tour Plan",
+        **_reporting_manager_from_body(body),
     }
     found = await db.select("approval_requests", filters={"approval_id": approval_id}, limit=1)
     if found:
@@ -1334,6 +1494,7 @@ async def submit_tour(body: dict = Body(...), user: dict = Depends(field_user), 
 @router.post("/tour-plans/submit-month")
 async def submit_month(body: dict = Body(...), user: dict = Depends(field_user), db: DB = Depends(get_db)):
     month = body.get("month") or date.today().strftime("%Y-%m")
+    manager_fields = _reporting_manager_from_body(body)
     start, end = month_bounds(month)
     rows = await db.select("tour_plans", filters={"employee_id": user["employee_id"], "plan_date": f"gte.{start}"})
     drafts = [row for row in rows if in_month(row.get("plan_date"), start, end) and row.get("status") in ("draft", "rejected")]
@@ -1350,7 +1511,14 @@ async def submit_month(body: dict = Body(...), user: dict = Depends(field_user),
         "sla": "24h",
         "details": f"Monthly tour plan {month}",
         "tour_type": "Monthly Tour Plan",
+        **manager_fields,
     }
+    if manager_fields.get("forwarded_to_name"):
+        await db.update(
+            "users",
+            {"manager": manager_fields["forwarded_to_name"]},
+            {"employee_id": user["employee_id"]},
+        )
     found = await db.select("approval_requests", filters={"approval_id": approval_id}, limit=1)
     if found:
         await db.update("approval_requests", approval, {"approval_id": approval_id})
@@ -1374,18 +1542,14 @@ def _tour_queue_item(row: dict, names: dict[str, dict]) -> dict:
 
 @router.get("/tour-approvals")
 async def tour_approvals(user: dict = Depends(field_user), db: DB = Depends(get_db), status: str = "pending"):
-    me = await _user_row(db, user["employee_id"])
+    manager_id = user["employee_id"]
+    direct_reports = await _direct_report_ids(db, manager_id)
     people = await db.select("users")
-    team = {
-        row.get("employee_id")
-        for row in people
-        if (row.get("manager") or "").strip().lower() == (me.get("name") or "").strip().lower()
-    }
     rows = await db.select("approval_requests", filters={"request_type": "tour"}, order="request_date.desc")
     names = {row.get("employee_id"): row for row in people}
     items = []
     for row in rows:
-        if row.get("employee_id") not in team:
+        if not _manager_can_see_tour_approval(row, manager_id, direct_reports):
             continue
         if status and (row.get("status") or "") != status:
             continue
