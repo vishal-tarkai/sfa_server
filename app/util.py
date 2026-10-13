@@ -6,6 +6,9 @@ import math
 import re
 from datetime import date, datetime, timezone
 from typing import Any
+from zoneinfo import ZoneInfo
+
+from app.config import FIELD_TIMEZONE
 
 MONTHS = [
     "January", "February", "March", "April", "May", "June",
@@ -17,13 +20,78 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
+def field_tz() -> ZoneInfo:
+    try:
+        return ZoneInfo(FIELD_TIMEZONE)
+    except Exception:
+        return ZoneInfo("Asia/Kolkata")
+
+
+def local_now() -> datetime:
+    return datetime.now(field_tz())
+
+
 def today_str() -> str:
-    return date.today().isoformat()
+    return local_now().date().isoformat()
+
+
+def parse_iso_datetime(value: Any) -> datetime | None:
+    if value is None or value == "":
+        return None
+    try:
+        text = str(value).strip().replace("Z", "+00:00")
+        moment = datetime.fromisoformat(text)
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=timezone.utc)
+        return moment
+    except ValueError:
+        return None
 
 
 def clock_label(moment: datetime | None = None) -> str:
-    moment = moment or datetime.now()
+    tz = field_tz()
+    if moment is None:
+        moment = datetime.now(tz)
+    elif moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc).astimezone(tz)
+    else:
+        moment = moment.astimezone(tz)
     return moment.strftime("%I:%M %p").lstrip("0")
+
+
+_DEVICE_CLOCK = re.compile(r"^(\d{1,2}):(\d{2})\s*([AP]M)$", re.I)
+
+
+def device_clock_label(value: Any) -> str | None:
+    """Accept mobile `h:mm a` strings for check-in/out display."""
+    text = str(value or "").strip()
+    match = _DEVICE_CLOCK.match(text)
+    if not match:
+        return None
+    hour = int(match.group(1))
+    minute = match.group(2)
+    if hour < 1 or hour > 12:
+        return None
+    ampm = match.group(3).upper()
+    label = f"{hour}:{minute} {ampm}"
+    return label.lstrip("0")
+
+
+def pick_clock_label(device_time: Any = None) -> str:
+    return device_clock_label(device_time) or clock_label()
+
+
+def attendance_display_time(row: dict | None, label_key: str, at_key: str) -> str | None:
+    """Prefer UTC instant columns formatted in field TZ; fall back to stored label."""
+    if not row:
+        return None
+    instant = parse_iso_datetime(row.get(at_key))
+    if instant is not None:
+        return clock_label(instant)
+    raw = row.get(label_key)
+    if raw in (None, "", "—", "-"):
+        return None
+    return str(raw)
 
 
 def period_label(moment: date | None = None) -> str:

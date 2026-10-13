@@ -24,7 +24,10 @@ from app.errors import APIError, respond
 from app.util import (
     area_card,
     as_date,
+    attendance_display_time,
     clock_label,
+    coerce_text_list,
+    pick_clock_label,
     entity_card,
     entity_visible_for_territory,
     haversine_m,
@@ -133,10 +136,12 @@ def _attendance_view(row: dict | None) -> dict:
     checkout = row.get("check_out")
     checked_out = bool(checkout) and checkout not in ("—", "-", "")
     checkin = row.get("check_in")
+    check_in_time = attendance_display_time(row, "check_in", "check_in_at")
+    check_out_time = attendance_display_time(row, "check_out", "check_out_at") if checked_out else None
     return {
         "is_checked_in": bool(checkin) and checkin not in ("—", "") and not checked_out,
-        "check_in_time": checkin if checkin not in ("—", "") else None,
-        "check_out_time": checkout if checked_out else None,
+        "check_in_time": check_in_time,
+        "check_out_time": check_out_time,
         "working_hours": row.get("duration") if row.get("duration") not in ("—", "", None) else None,
         "attendance_status": row.get("attendance_status") or row.get("status") or "absent",
         "location_status_in": row.get("location_status_in") or "online",
@@ -158,36 +163,96 @@ async def _org_nodes(db: DB) -> list[dict]:
     return await db.select("org_nodes", order="label.asc")
 
 
-async def _assigned_areas(db: DB, employee_id: str) -> list[dict]:
-    user = await _user_row(db, employee_id)
-    nodes = await _org_nodes(db)
-    by_id = {node.get("node_id"): node for node in nodes}
-    children: dict[str | None, list] = {}
+def _dedupe_node_ids(ids: list[str]) -> list[str]:
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for node_id in ids:
+        key = (node_id or "").strip()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        ordered.append(key)
+    return ordered
+
+
+def _org_children_index(nodes: list[dict]) -> tuple[dict[str, dict], dict[str | None, list[dict]]]:
+    by_id = {node.get("node_id"): node for node in nodes if node.get("node_id")}
+    children: dict[str | None, list[dict]] = {}
     for node in nodes:
         children.setdefault(node.get("parent_id"), []).append(node)
+    return by_id, children
+
+
+def _expand_org_subtree(node_id: str, by_id: dict[str, dict], children: dict[str | None, list[dict]]) -> list[dict]:
+    stack = [node_id]
+    seen: set[str] = set()
+    picked: list[dict] = []
+    while stack:
+        current = stack.pop()
+        if current in seen:
+            continue
+        seen.add(current)
+        node = by_id.get(current)
+        if node:
+            picked.append(node)
+        for child in children.get(current, []):
+            cid = child.get("node_id")
+            if cid:
+                stack.append(cid)
+    return picked
+
+
+def _assigned_area_nodes(user: dict, nodes: list[dict]) -> list[dict]:
+    """Admin saves multi-area MR coverage in assigned_org_* columns; org_node_id is only primary."""
+    by_id, children = _org_children_index(nodes)
+    explicit_ids = _dedupe_node_ids(
+        coerce_text_list(user.get("assigned_org_area_ids"))
+        + coerce_text_list(user.get("assigned_org_territory_ids"))
+        + coerce_text_list(user.get("assigned_org_node_ids"))
+    )
+    if explicit_ids:
+        picked: list[dict] = []
+        seen_nodes: set[str] = set()
+        for node_id in explicit_ids:
+            node = by_id.get(node_id)
+            if not node:
+                continue
+            ntype = (node.get("node_type") or "").lower()
+            if ntype == "region":
+                for sub in _expand_org_subtree(node_id, by_id, children):
+                    sid = sub.get("node_id")
+                    if sid and sid not in seen_nodes:
+                        seen_nodes.add(sid)
+                        picked.append(sub)
+                continue
+            if node_id in seen_nodes:
+                continue
+            seen_nodes.add(node_id)
+            picked.append(node)
+        picked = [node for node in picked if (node.get("node_type") or "").lower() != "region"]
+        if picked:
+            picked.sort(key=lambda row: (row.get("label") or "").lower())
+            return picked
+
     root_id = user.get("org_node_id")
     picked: list[dict] = []
     if root_id and root_id in by_id:
-        stack = [root_id]
-        seen = set()
-        while stack:
-            current = stack.pop()
-            if current in seen:
-                continue
-            seen.add(current)
-            node = by_id.get(current)
-            if node:
-                picked.append(node)
-            for child in children.get(current, []):
-                stack.append(child.get("node_id"))
+        picked = _expand_org_subtree(str(root_id), by_id, children)
     if not picked:
         territory = (user.get("territory") or "").strip().lower()
         picked = [
             node for node in nodes
             if (node.get("label") or "").strip().lower() == territory
-            or (node.get("node_type") or "") == "area"
         ]
-    return [area_card(node) for node in picked]
+    picked = [node for node in picked if (node.get("node_type") or "").lower() != "region"]
+    picked.sort(key=lambda row: (row.get("label") or "").lower())
+    return picked
+
+
+async def _assigned_areas(db: DB, employee_id: str) -> list[dict]:
+    user = await _user_row(db, employee_id)
+    nodes = await _org_nodes(db)
+    return [area_card(node) for node in _assigned_area_nodes(user, nodes)]
 
 
 def _claim(row: dict, name: str = "") -> dict:
@@ -594,7 +659,7 @@ async def check_in(body: dict = Body(default={}), user: dict = Depends(field_use
             raise APIError(422, "Location is required to check in", "VALIDATION_ERROR")
         if not _inside_office(lat, lng, offices):
             raise APIError(422, "You are outside the allowed office radius", "OUTSIDE_GEOFENCE")
-    label = clock_label()
+    label = pick_clock_label(body.get("device_time"))
     row = {
         "employee_id": user["employee_id"],
         "attendance_date": today_str(),
@@ -650,7 +715,7 @@ async def check_out(body: dict = Body(default={}), user: dict = Depends(field_us
         raise APIError(422, "You are outside the allowed office radius", "OUTSIDE_GEOFENCE")
     extended = minutes > EXTENDED_MINUTES
     status = "offline_attendance" if force or existing.get("location_status_in") == "offline" else ("extended_hours" if extended else "present" if minutes >= PRESENT_MINUTES else "half_day")
-    label = clock_label()
+    label = pick_clock_label(body.get("device_time"))
     hours, mins = divmod(minutes, 60)
     duration = f"{hours:02d}:{mins:02d}"
     await db.update("attendance_records", {
@@ -700,8 +765,10 @@ async def attendance_report(user: dict = Depends(field_user), db: DB = Depends(g
             "month": period_label(date.fromisoformat(day)) if day else month,
             "day": date.fromisoformat(day).strftime("%a") if day else "",
             "date": day,
-            "check_in": row.get("check_in"),
-            "check_out": None if row.get("check_out") in ("—", "", None) else row.get("check_out"),
+            "check_in": attendance_display_time(row, "check_in", "check_in_at"),
+            "check_out": attendance_display_time(row, "check_out", "check_out_at")
+            if row.get("check_out") not in ("—", "", None)
+            else None,
             "is_late": status in ("late", "half_day"),
             "duration": None if row.get("duration") in ("—", "", None) else row.get("duration"),
             "status": status,

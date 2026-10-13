@@ -70,6 +70,8 @@ PORT = int(os.environ.get("PORT", "8080"))
 OFFICE_LAT = float(os.environ.get("ATTENDANCE_OFFICE_LAT", "30.512355"))
 OFFICE_LNG = float(os.environ.get("ATTENDANCE_OFFICE_LNG", "76.807612"))
 OFFICE_RADIUS_M = float(os.environ.get("ATTENDANCE_OFFICE_RADIUS_METERS", "500"))
+# Wall-clock for attendance labels and attendance_date (Render defaults to UTC without this).
+FIELD_TIMEZONE = os.environ.get("FIELD_TIMEZONE", "Asia/Kolkata").strip() or "Asia/Kolkata"
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
