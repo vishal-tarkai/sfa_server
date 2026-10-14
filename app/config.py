@@ -3,7 +3,7 @@
 Search order (SFA_v2 monorepo or sfa_server clone):
   1) CMS/.env
   2) repo-root .env
-  3) server/.env  (this repo root when deployed standalone)
+  3) sfa_api/.env  (this folder when run locally or on Render)
 """
 
 from __future__ import annotations
