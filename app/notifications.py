@@ -184,6 +184,48 @@ async def notify_tour_submitted_to_manager(
     )
 
 
+async def notify_pob_submitted_to_seniors(
+    db: DB,
+    *,
+    submitter_id: str,
+    submitter_name: str,
+    senior_employee_ids: list[str],
+    order_id: str,
+    contact_name: str,
+    total_amount: float,
+    item_count: int,
+) -> None:
+    """Alert each manager in the submitter's reporting / org chain."""
+    if not senior_employee_ids:
+        return
+    amount_label = (
+        f"₹{int(total_amount):,}"
+        if float(total_amount).is_integer()
+        else f"₹{total_amount:,.2f}"
+    )
+    contact = (contact_name or "").strip() or "customer"
+    title = "New POB order"
+    description = (
+        f"{submitter_name} placed a POB order for {contact} "
+        f"({item_count} item{'s' if item_count != 1 else ''}, {amount_label})."
+    )
+    for senior_id in senior_employee_ids:
+        sid = (senior_id or "").strip()
+        if not sid or sid == submitter_id:
+            continue
+        await create_user_notification(
+            db,
+            employee_id=sid,
+            title=title,
+            description=description,
+            notification_type="report",
+            reference_type="pob",
+            reference_id=order_id,
+            action_url="/notifications",
+            notification_id=_safe_notification_id(f"pob_submit_{sid}", order_id),
+        )
+
+
 async def notify_leave_submitted_to_manager(
     db: DB,
     *,

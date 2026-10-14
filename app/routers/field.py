@@ -26,6 +26,7 @@ from app.notifications import (
     notify_dpr_submitted_to_manager,
     notify_leave_reviewed_to_employee,
     notify_leave_submitted_to_manager,
+    notify_pob_submitted_to_seniors,
     notify_tour_reviewed_to_employee,
     notify_tour_submitted_to_manager,
 )
@@ -131,6 +132,74 @@ async def _manager_fields_for_tour_submit(db: DB, employee_id: str, body: dict) 
     if fields.get("forwarded_to_name"):
         inferred["forwarded_to_name"] = fields["forwarded_to_name"]
     return inferred
+
+
+async def _senior_employee_ids_for_notify(db: DB, employee_id: str) -> list[str]:
+    """Direct manager(s) and seniors up `users.manager` + org node parent chain."""
+    submitter = str(employee_id or "").strip()
+    if not submitter:
+        return []
+
+    people = await db.select("users")
+    by_id: dict[str, dict] = {}
+    by_name: dict[str, str] = {}
+    for person in people:
+        pid = str(person.get("employee_id") or "").strip()
+        if not pid:
+            continue
+        by_id[pid] = person
+        name_key = (person.get("name") or "").strip().lower()
+        if name_key and name_key not in by_name:
+            by_name[name_key] = pid
+
+    ordered: list[str] = []
+    seen: set[str] = set()
+
+    def add(manager_id: str) -> None:
+        mid = str(manager_id or "").strip()
+        if not mid or mid == submitter or mid in seen or mid not in by_id:
+            return
+        seen.add(mid)
+        ordered.append(mid)
+
+    current = submitter
+    for _ in range(24):
+        row = by_id.get(current)
+        if not row:
+            break
+        mgr_name = (row.get("manager") or "").strip()
+        if not mgr_name or mgr_name in ("—", "-"):
+            break
+        mgr_id = by_name.get(mgr_name.lower(), "")
+        if not mgr_id or mgr_id == current:
+            break
+        add(mgr_id)
+        current = mgr_id
+
+    user_row = by_id.get(submitter) or await _user_row(db, submitter)
+    nodes = await _org_nodes(db)
+    by_node = {node.get("node_id"): node for node in nodes if node.get("node_id")}
+
+    def walk_org_from_node(node_id: str | None) -> None:
+        nid = str(node_id or "").strip()
+        visited_nodes: set[str] = set()
+        while nid and nid not in visited_nodes:
+            visited_nodes.add(nid)
+            node = by_node.get(nid)
+            if not node:
+                break
+            add(str(node.get("manager_employee_id") or "").strip())
+            nid = str(node.get("parent_id") or "").strip() or ""
+
+    walk_org_from_node(str(user_row.get("org_node_id") or "").strip())
+    for extra_id in (
+        coerce_text_list(user_row.get("assigned_org_node_ids"))
+        + coerce_text_list(user_row.get("assigned_org_territory_ids"))
+        + coerce_text_list(user_row.get("assigned_org_area_ids"))
+    ):
+        walk_org_from_node(extra_id)
+
+    return ordered
 
 
 def _manager_can_see_tour_approval(
@@ -2173,6 +2242,22 @@ async def submit_pob(body: dict = Body(...), user: dict = Depends(field_user), d
         "updated_at": now_iso(),
     })
     await db.insert("pob_order_items", line_rows)
+
+    person = await _user_row(db, user["employee_id"])
+    submitter_name = str(person.get("name") or user["employee_id"])
+    seniors = await _senior_employee_ids_for_notify(db, user["employee_id"])
+    if seniors:
+        await notify_pob_submitted_to_seniors(
+            db,
+            submitter_id=user["employee_id"],
+            submitter_name=submitter_name,
+            senior_employee_ids=seniors,
+            order_id=order_id,
+            contact_name=str(body.get("contact_name") or ""),
+            total_amount=total,
+            item_count=len(line_rows),
+        )
+
     return respond("Order submitted", {"order_id": order_id, "status": "submitted", "total_amount": total, "item_count": len(line_rows)}, 201)
 
 
@@ -2592,8 +2677,34 @@ async def read_one(notification_id: str, user: dict = Depends(field_user), db: D
     return respond("Marked read", {"id": notification_id, "is_read": True, "unread_count": len(unread)})
 
 
+@router.delete("/notifications")
+async def delete_all_notifications(user: dict = Depends(field_user), db: DB = Depends(get_db)):
+    rows = await db.select(
+        "user_notifications",
+        filters={"employee_id": user["employee_id"]},
+    )
+    deleted = 0
+    for row in rows:
+        key = row.get("notification_id")
+        if not key:
+            continue
+        await db.delete("user_notifications", {"notification_id": key})
+        deleted += 1
+    return respond("Cleared", {"deleted_count": deleted, "unread_count": 0})
+
+
 @router.delete("/notifications/{notification_id}")
 async def dismiss_notification(notification_id: str, user: dict = Depends(field_user), db: DB = Depends(get_db)):
-    del user
+    rows = await db.select(
+        "user_notifications",
+        filters={"notification_id": notification_id},
+        limit=1,
+    )
+    if not rows or str(rows[0].get("employee_id") or "") != str(user["employee_id"]):
+        raise APIError(404, "Notification not found", "NOT_FOUND")
     await db.delete("user_notifications", {"notification_id": notification_id})
-    return respond("Dismissed", None)
+    unread = await db.select(
+        "user_notifications",
+        filters={"employee_id": user["employee_id"], "is_read": "eq.false"},
+    )
+    return respond("Deleted", {"id": notification_id, "unread_count": len(unread)})
