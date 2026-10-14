@@ -91,14 +91,53 @@ async def _direct_report_ids(db: DB, manager_employee_id: str) -> set[str]:
     }
 
 
+def _employee_ids_equal(left: str | None, right: str | None) -> bool:
+    return (left or "").strip().upper() == (right or "").strip().upper()
+
+
+async def _infer_manager_fields_from_profile(db: DB, employee_id: str) -> dict[str, str]:
+    """Map users.manager name → approver employee_id when the app omits reporting_manager_id."""
+    row = await _user_row(db, employee_id)
+    mgr_name = (row.get("manager") or "").strip()
+    if not mgr_name or mgr_name in ("—", "-"):
+        return {}
+    people = await db.select("users")
+    for person in people:
+        if (person.get("name") or "").strip().lower() == mgr_name.lower():
+            return {
+                "forwarded_to": str(person.get("employee_id") or "").strip(),
+                "forwarded_to_name": person.get("name") or mgr_name,
+            }
+    return {"forwarded_to_name": mgr_name}
+
+
+async def _manager_fields_for_tour_submit(db: DB, employee_id: str, body: dict) -> dict[str, str]:
+    fields = _reporting_manager_from_body(body)
+    if fields.get("forwarded_to"):
+        if not fields.get("forwarded_to_name"):
+            people = await db.select("users", filters={"employee_id": fields["forwarded_to"]}, limit=1)
+            if people:
+                fields["forwarded_to_name"] = people[0].get("name") or ""
+        return fields
+    inferred = await _infer_manager_fields_from_profile(db, employee_id)
+    if fields.get("forwarded_to_name"):
+        inferred["forwarded_to_name"] = fields["forwarded_to_name"]
+    return inferred
+
+
 def _manager_can_see_tour_approval(
     row: dict,
     manager_employee_id: str,
+    manager_name: str,
     direct_report_ids: set[str],
 ) -> bool:
     forwarded = str(row.get("forwarded_to") or "").strip()
     if forwarded:
-        return forwarded == manager_employee_id
+        if _employee_ids_equal(forwarded, manager_employee_id):
+            return True
+        fwd_name = str(row.get("forwarded_to_name") or "").strip().lower()
+        me_name = (manager_name or "").strip().lower()
+        return bool(fwd_name and me_name and fwd_name == me_name)
     return row.get("employee_id") in direct_report_ids
 
 
@@ -986,12 +1025,27 @@ async def dpr_entry(user: dict = Depends(field_user), db: DB = Depends(get_db), 
     })
 
 
+def _is_reporting_manager_user(row: dict) -> bool:
+    """Tour plan / DPR: pick a manager (AM, RSM, NSM), not another MR."""
+    role = str(row.get("role") or "").lower()
+    designation = str(row.get("designation") or "").lower()
+    text = f"{role} {designation}"
+    if designation in ("mr",) or role == "medical rep":
+        return False
+    if "senior mr" in text:
+        return False
+    keywords = ("manager", "nsm", "rsm", "zsm", "regional", "area manager", "head")
+    return any(key in text for key in keywords)
+
+
 @router.get("/dpr/seniors")
 async def dpr_seniors(user: dict = Depends(field_user), db: DB = Depends(get_db), q: str = ""):
     rows = await db.select("users", filters={"status": "active"}, order="name.asc")
     items = []
     for row in rows:
         if row.get("employee_id") == user["employee_id"]:
+            continue
+        if not _is_reporting_manager_user(row):
             continue
         if q and q.lower() not in (row.get("name") or "").lower():
             continue
@@ -1471,6 +1525,7 @@ async def save_draft(body: dict = Body(...), user: dict = Depends(field_user), d
 async def submit_tour(body: dict = Body(...), user: dict = Depends(field_user), db: DB = Depends(get_db)):
     saved = await _save_tour(db, user["employee_id"], body, "pending")
     approval_id = f"APR-{saved['plan_id']}"
+    manager_fields = await _manager_fields_for_tour_submit(db, user["employee_id"], body)
     approval = {
         "approval_id": approval_id,
         "employee_id": user["employee_id"],
@@ -1481,7 +1536,7 @@ async def submit_tour(body: dict = Body(...), user: dict = Depends(field_user), 
         "sla": "24h",
         "details": f"Tour plan {saved['plan_date']}",
         "tour_type": "Daily Tour Plan",
-        **_reporting_manager_from_body(body),
+        **manager_fields,
     }
     found = await db.select("approval_requests", filters={"approval_id": approval_id}, limit=1)
     if found:
@@ -1491,10 +1546,74 @@ async def submit_tour(body: dict = Body(...), user: dict = Depends(field_user), 
     return respond("Submitted for approval", {"plan_id": saved["plan_id"], "status": "pending", "approval_id": approval_id})
 
 
+async def _patch_approval_manager_fields(
+    db: DB, approval_id: str, manager_fields: dict[str, str]
+) -> None:
+    if not manager_fields:
+        return
+    rows = await db.select("approval_requests", filters={"approval_id": approval_id}, limit=1)
+    if not rows:
+        return
+    row = rows[0]
+    patch: dict[str, Any] = {}
+    if manager_fields.get("forwarded_to") and not str(row.get("forwarded_to") or "").strip():
+        patch["forwarded_to"] = manager_fields["forwarded_to"]
+    if manager_fields.get("forwarded_to_name") and not str(row.get("forwarded_to_name") or "").strip():
+        patch["forwarded_to_name"] = manager_fields["forwarded_to_name"]
+    if patch:
+        patch["updated_at"] = now_iso()
+        await db.update("approval_requests", patch, {"approval_id": approval_id})
+
+
+async def _ensure_tour_approval_rows_for_month(
+    db: DB,
+    employee_id: str,
+    month: str,
+    manager_fields: dict[str, str],
+) -> int:
+    """Create missing approval_requests for pending days (fixes DB rows with no senior queue entry)."""
+    start, end = month_bounds(month)
+    rows = await db.select("tour_plans", filters={"employee_id": employee_id, "plan_date": f"gte.{start}"})
+    repaired = 0
+    monthly_id = f"APR-MONTH-{employee_id}-{month}"
+    await _patch_approval_manager_fields(db, monthly_id, manager_fields)
+
+    for row in rows:
+        if not in_month(row.get("plan_date"), start, end):
+            continue
+        if row.get("status") != "pending":
+            continue
+        plan_id = row.get("plan_id")
+        if not plan_id:
+            continue
+        aid = f"APR-{plan_id}"
+        existing = await db.select("approval_requests", filters={"approval_id": aid}, limit=1)
+        if existing:
+            await _patch_approval_manager_fields(db, aid, manager_fields)
+            continue
+        await db.insert(
+            "approval_requests",
+            {
+                "approval_id": aid,
+                "employee_id": employee_id,
+                "request_type": "tour",
+                "request_date": as_date(row.get("plan_date")) or start,
+                "submitted_time": row.get("submitted_time") or clock_label(),
+                "status": "pending",
+                "sla": "24h",
+                "details": f"Tour plan {row.get('plan_date')}",
+                "tour_type": "Daily Tour Plan",
+                **manager_fields,
+            },
+        )
+        repaired += 1
+    return repaired
+
+
 @router.post("/tour-plans/submit-month")
 async def submit_month(body: dict = Body(...), user: dict = Depends(field_user), db: DB = Depends(get_db)):
     month = body.get("month") or date.today().strftime("%Y-%m")
-    manager_fields = _reporting_manager_from_body(body)
+    manager_fields = await _manager_fields_for_tour_submit(db, user["employee_id"], body)
     start, end = month_bounds(month)
     rows = await db.select("tour_plans", filters={"employee_id": user["employee_id"], "plan_date": f"gte.{start}"})
     drafts = [row for row in rows if in_month(row.get("plan_date"), start, end) and row.get("status") in ("draft", "rejected")]
@@ -1524,7 +1643,25 @@ async def submit_month(body: dict = Body(...), user: dict = Depends(field_user),
         await db.update("approval_requests", approval, {"approval_id": approval_id})
     else:
         await db.insert("approval_requests", approval)
-    return respond("Month submitted", {"month": month, "approval_id": approval_id, "status": "pending", "plan_count": len(drafts)})
+    repaired = await _ensure_tour_approval_rows_for_month(
+        db, user["employee_id"], month, manager_fields
+    )
+    pending_in_month = sum(
+        1
+        for row in rows
+        if in_month(row.get("plan_date"), start, end) and row.get("status") == "pending"
+    )
+    return respond(
+        "Month submitted",
+        {
+            "month": month,
+            "approval_id": approval_id,
+            "status": "pending",
+            "plan_count": len(drafts),
+            "pending_days": pending_in_month,
+            "approvals_repaired": repaired,
+        },
+    )
 
 
 def _tour_queue_item(row: dict, names: dict[str, dict]) -> dict:
@@ -1533,6 +1670,7 @@ def _tour_queue_item(row: dict, names: dict[str, dict]) -> dict:
         "approval_id": row.get("approval_id"),
         "employee_id": row.get("employee_id"),
         "employee_name": person.get("name") or "",
+        "profile_image_url": person.get("profile_image_url") or "",
         "month": str(row.get("request_date") or "")[:7],
         "status": row.get("status") or "pending",
         "submitted_at": row.get("applied_at") or row.get("submitted_time"),
@@ -1542,14 +1680,16 @@ def _tour_queue_item(row: dict, names: dict[str, dict]) -> dict:
 
 @router.get("/tour-approvals")
 async def tour_approvals(user: dict = Depends(field_user), db: DB = Depends(get_db), status: str = "pending"):
+    me = await _user_row(db, user["employee_id"])
     manager_id = user["employee_id"]
+    manager_name = me.get("name") or ""
     direct_reports = await _direct_report_ids(db, manager_id)
     people = await db.select("users")
     rows = await db.select("approval_requests", filters={"request_type": "tour"}, order="request_date.desc")
     names = {row.get("employee_id"): row for row in people}
     items = []
     for row in rows:
-        if not _manager_can_see_tour_approval(row, manager_id, direct_reports):
+        if not _manager_can_see_tour_approval(row, manager_id, manager_name, direct_reports):
             continue
         if status and (row.get("status") or "") != status:
             continue
