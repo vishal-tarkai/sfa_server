@@ -24,6 +24,8 @@ from app.errors import APIError, respond
 from app.notifications import (
     notify_dpr_reviewed_to_employee,
     notify_dpr_submitted_to_manager,
+    notify_expense_reviewed_to_employee,
+    notify_expense_submitted_to_seniors,
     notify_leave_reviewed_to_employee,
     notify_leave_submitted_to_manager,
     notify_pob_submitted_to_seniors,
@@ -2577,6 +2579,163 @@ async def reject_leave(approval_id: str, body: dict = Body(default={}), user: di
     return respond("Leave rejected", await _review_leave(db, approval_id, "rejected", str(body.get("review_note") or "")))
 
 
+@router.get("/leaves/approvals")
+async def leave_approvals(user: dict = Depends(field_user), db: DB = Depends(get_db), status: str = "pending"):
+    manager_id = user["employee_id"]
+    people = await _name_map(db)
+    rows = await db.select("approval_requests", filters={"request_type": "leave"}, order="applied_at.desc")
+    items = []
+    for row in rows:
+        if status and (row.get("status") or "pending") != status:
+            continue
+        forwarded = str(row.get("forwarded_to") or "").strip()
+        if not _employee_ids_equal(forwarded, manager_id):
+            continue
+        employee_id = str(row.get("employee_id") or "")
+        person = people.get(employee_id) or {}
+        item = _leave_item(row)
+        item["employee_name"] = person.get("name") or employee_id
+        items.append(item)
+    return respond("OK", {"items": items})
+
+
+def _manager_can_see_expense_claim(
+    row: dict,
+    manager_employee_id: str,
+    manager_name: str,
+    direct_report_ids: set[str],
+) -> bool:
+    employee_id = str(row.get("employee_id") or "").strip()
+    if employee_id == manager_employee_id:
+        return False
+    forwarded = str(row.get("forwarded_to") or "").strip()
+    if forwarded:
+        if _employee_ids_equal(forwarded, manager_employee_id):
+            return True
+        fwd_name = str(row.get("forwarded_to_name") or "").strip().lower()
+        me_name = (manager_name or "").strip().lower()
+        if fwd_name and me_name and fwd_name == me_name:
+            return True
+    return employee_id in direct_report_ids
+
+
+async def _manager_can_review_expense(
+    db: DB,
+    claim: dict,
+    manager_employee_id: str,
+    senior_cache: dict[str, list[str]] | None = None,
+) -> bool:
+    me = await _user_row(db, manager_employee_id)
+    manager_name = me.get("name") or ""
+    direct_reports = await _direct_report_ids(db, manager_employee_id)
+    if _manager_can_see_expense_claim(
+        claim, manager_employee_id, manager_name, direct_reports
+    ):
+        return True
+    employee_id = str(claim.get("employee_id") or "").strip()
+    if not employee_id:
+        return False
+    cache = senior_cache if senior_cache is not None else {}
+    if employee_id not in cache:
+        cache[employee_id] = await _senior_employee_ids_for_notify(db, employee_id)
+    seniors = cache[employee_id]
+    return any(_employee_ids_equal(sid, manager_employee_id) for sid in seniors)
+
+
+async def _set_expense_claim_status(
+    db: DB,
+    claim_id: str,
+    manager: dict,
+    status: str,
+    note: str = "",
+) -> dict:
+    rows = await db.select("expense_claims", filters={"claim_id": claim_id}, limit=1)
+    if not rows:
+        raise APIError(404, "Expense claim not found", "NOT_FOUND")
+    row = rows[0]
+    if not await _manager_can_review_expense(db, row, manager["employee_id"]):
+        raise APIError(403, "You cannot review this expense claim", "FORBIDDEN")
+    prior_status = str(row.get("status") or "pending")
+    if prior_status != "pending":
+        raise APIError(409, "Claim has already been reviewed", "CLAIM_ALREADY_REVIEWED")
+    updates = {
+        "status": status,
+        "review_note": note,
+        "updated_at": now_iso(),
+    }
+    await db.update("expense_claims", updates, {"claim_id": claim_id})
+    if status in ("approved", "rejected"):
+        claim_date = as_date(row.get("claim_date")) or str(row.get("claim_date") or "")
+        await notify_expense_reviewed_to_employee(
+            db,
+            employee_id=str(row.get("employee_id") or ""),
+            claim_id=claim_id,
+            claim_date=claim_date,
+            approved=status == "approved",
+            review_note=note,
+        )
+    return {"claim_id": claim_id, "status": status, "review_note": note}
+
+
+@router.get("/expenses/approvals")
+async def expense_approvals(user: dict = Depends(field_user), db: DB = Depends(get_db), status: str = "pending"):
+    names = await _name_map(db)
+    rows = await db.select("expense_claims", order="claim_date.desc")
+    senior_cache: dict[str, list[str]] = {}
+    items = []
+    for row in rows:
+        if status and (row.get("status") or "pending") != status:
+            continue
+        if not await _manager_can_review_expense(
+            db, row, user["employee_id"], senior_cache
+        ):
+            continue
+        employee_id = str(row.get("employee_id") or "").strip()
+        person = names.get(employee_id) or {}
+        items.append(_claim(row, person.get("name") or ""))
+    pending = sum(1 for item in items if item.get("status") == "pending")
+    return respond("OK", {"pending_count": pending, "items": items})
+
+
+@router.get("/expenses/approvals/{claim_id}")
+async def expense_approval_detail(claim_id: str, user: dict = Depends(field_user), db: DB = Depends(get_db)):
+    rows = await db.select("expense_claims", filters={"claim_id": claim_id}, limit=1)
+    if not rows:
+        raise APIError(404, "Expense claim not found", "NOT_FOUND")
+    row = rows[0]
+    if not await _manager_can_review_expense(db, row, user["employee_id"]):
+        owner = str(row.get("employee_id") or "")
+        if owner != user["employee_id"]:
+            raise APIError(403, "You cannot view this expense claim", "FORBIDDEN")
+    names = await _name_map(db)
+    person = names.get(row.get("employee_id")) or {}
+    return respond("OK", _claim(row, person.get("name") or ""))
+
+
+@router.post("/expenses/approvals/{claim_id}/approve")
+async def approve_expense_claim(
+    claim_id: str,
+    user: dict = Depends(field_user),
+    db: DB = Depends(get_db),
+    body: dict | None = Body(default=None),
+):
+    note = str((body or {}).get("review_note") or "")
+    data = await _set_expense_claim_status(db, claim_id, user, "approved", note)
+    return respond("Expense approved", data)
+
+
+@router.post("/expenses/approvals/{claim_id}/reject")
+async def reject_expense_claim(
+    claim_id: str,
+    user: dict = Depends(field_user),
+    db: DB = Depends(get_db),
+    body: dict | None = Body(default=None),
+):
+    note = str((body or {}).get("review_note") or "")
+    data = await _set_expense_claim_status(db, claim_id, user, "rejected", note)
+    return respond("Expense rejected", data)
+
+
 @router.get("/expenses")
 async def list_expenses(user: dict = Depends(field_user), db: DB = Depends(get_db), month: str = ""):
     rows = await db.select("expense_claims", filters={"employee_id": user["employee_id"]}, order="claim_date.desc")
@@ -2602,6 +2761,14 @@ async def submit_expense(body: dict = Body(...), user: dict = Depends(field_user
     phone = num(body.get("phone_allowance"))
     internet = num(body.get("internet_reimbursement"))
     total = misc + phone + internet
+    manager_fields = await _manager_fields_for_tour_submit(db, user["employee_id"], body)
+    seniors = await _senior_employee_ids_for_notify(db, user["employee_id"])
+    forwarded_to = str(manager_fields.get("forwarded_to") or "").strip()
+    forwarded_to_name = str(manager_fields.get("forwarded_to_name") or "").strip()
+    if not forwarded_to and seniors:
+        forwarded_to = seniors[0]
+        approver = await _user_row(db, forwarded_to)
+        forwarded_to_name = (approver.get("name") or "").strip()
     payload = {
         "claim_date": claim_date,
         "status": "pending",
@@ -2611,6 +2778,8 @@ async def submit_expense(body: dict = Body(...), user: dict = Depends(field_user
         "total_amount": total,
         "comment": body.get("comment") or "",
         "review_note": "",
+        "forwarded_to": forwarded_to,
+        "forwarded_to_name": forwarded_to_name,
         "submitted_at": now_iso(),
         "updated_at": now_iso(),
     }
@@ -2622,6 +2791,22 @@ async def submit_expense(body: dict = Body(...), user: dict = Depends(field_user
         payload["claim_id"] = claim_id
         payload["employee_id"] = user["employee_id"]
         await db.insert("expense_claims", payload)
+    submitter = await _user_row(db, user["employee_id"])
+    submitter_name = str(submitter.get("name") or user["employee_id"])
+    notify_ids = list(seniors)
+    if forwarded_to and forwarded_to not in notify_ids:
+        notify_ids.insert(0, forwarded_to)
+    if not notify_ids and forwarded_to:
+        notify_ids = [forwarded_to]
+    await notify_expense_submitted_to_seniors(
+        db,
+        submitter_id=user["employee_id"],
+        submitter_name=submitter_name,
+        senior_employee_ids=notify_ids,
+        claim_id=str(claim_id),
+        claim_date=as_date(claim_date) or claim_date,
+        total_amount=total,
+    )
     return respond("Claim submitted", {"claim_id": claim_id, "status": "pending"}, 201)
 
 

@@ -322,6 +322,83 @@ async def notify_leave_reviewed_to_employee(
     )
 
 
+async def notify_expense_submitted_to_seniors(
+    db: DB,
+    *,
+    submitter_id: str,
+    submitter_name: str,
+    senior_employee_ids: list[str],
+    claim_id: str,
+    claim_date: str,
+    total_amount: float,
+) -> None:
+    """Alert managers in the submitter's hierarchy that a claim needs review."""
+    if not senior_employee_ids:
+        return
+    amount_label = (
+        f"₹{int(total_amount):,}"
+        if float(total_amount).is_integer()
+        else f"₹{total_amount:,.2f}"
+    )
+    title = "New expense claim"
+    description = (
+        f"{submitter_name} submitted an expense claim for {claim_date} "
+        f"({amount_label})."
+    )
+    for senior_id in senior_employee_ids:
+        sid = str(senior_id or "").strip()
+        if not sid or sid == submitter_id:
+            continue
+        await create_user_notification(
+            db,
+            employee_id=sid,
+            title=title,
+            description=description,
+            notification_type="report",
+            reference_type="expense",
+            reference_id=claim_id,
+            action_url="/expenses",
+            notification_id=_safe_notification_id(
+                f"expense_submit_{sid}",
+                claim_id,
+            ),
+        )
+
+
+async def notify_expense_reviewed_to_employee(
+    db: DB,
+    *,
+    employee_id: str,
+    claim_id: str,
+    claim_date: str,
+    approved: bool,
+    review_note: str = "",
+) -> None:
+    if not employee_id:
+        return
+    if approved:
+        title = "Expense claim approved"
+        description = f"Your expense claim for {claim_date} has been approved."
+        suffix = "approved"
+    else:
+        title = "Expense claim rejected"
+        description = f"Your expense claim for {claim_date} has been rejected."
+        if review_note.strip():
+            description = f"{description} Remarks: {review_note.strip()}"
+        suffix = "rejected"
+    await create_user_notification(
+        db,
+        employee_id=employee_id,
+        title=title,
+        description=description,
+        notification_type="report",
+        reference_type="expense",
+        reference_id=claim_id,
+        action_url="/expenses",
+        notification_id=_safe_notification_id(f"expense_{suffix}", claim_id),
+    )
+
+
 async def notify_tour_reviewed_to_employee(
     db: DB,
     *,
