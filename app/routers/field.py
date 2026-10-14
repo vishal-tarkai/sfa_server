@@ -21,6 +21,14 @@ from app.config import (
 from app.db import DB
 from app.deps import get_db
 from app.errors import APIError, respond
+from app.notifications import (
+    notify_dpr_reviewed_to_employee,
+    notify_dpr_submitted_to_manager,
+    notify_leave_reviewed_to_employee,
+    notify_leave_submitted_to_manager,
+    notify_tour_reviewed_to_employee,
+    notify_tour_submitted_to_manager,
+)
 from app.util import (
     area_card,
     as_date,
@@ -139,6 +147,29 @@ def _manager_can_see_tour_approval(
         me_name = (manager_name or "").strip().lower()
         return bool(fwd_name and me_name and fwd_name == me_name)
     return row.get("employee_id") in direct_report_ids
+
+
+async def _resolve_tour_plan_employee_id(
+    db: DB, user: dict, requested_employee_id: str | None
+) -> str:
+    subject = str(requested_employee_id or user["employee_id"]).strip()
+    if _employee_ids_equal(subject, user["employee_id"]):
+        return subject
+    me = await _user_row(db, user["employee_id"])
+    manager_name = me.get("name") or ""
+    direct_reports = await _direct_report_ids(db, user["employee_id"])
+    if subject in direct_reports:
+        return subject
+    rows = await db.select(
+        "approval_requests",
+        filters={"employee_id": subject, "request_type": "tour"},
+    )
+    for row in rows:
+        if _manager_can_see_tour_approval(
+            row, user["employee_id"], manager_name, direct_reports
+        ):
+            return subject
+    raise APIError(403, "You cannot view this employee's tour plans", "FORBIDDEN")
 
 
 def _env_head_office() -> dict:
@@ -1283,6 +1314,20 @@ async def submit_dpr(body: dict = Body(...), user: dict = Depends(field_user), d
     if visit_rows:
         await db.insert("dpr_visit_details", visit_rows)
     payload["dpr_id"] = dpr_id
+
+    manager_fields = await _manager_fields_for_tour_submit(db, employee_id, body)
+    manager_id = str(manager_fields.get("forwarded_to") or "").strip()
+    if manager_id:
+        submitter_name = str(person.get("name") or employee_id)
+        await notify_dpr_submitted_to_manager(
+            db,
+            submitter_id=employee_id,
+            submitter_name=submitter_name,
+            manager_employee_id=manager_id,
+            dpr_id=dpr_id,
+            report_date=str(report_date),
+        )
+
     return respond("DPR submitted", payload, 201)
 
 
@@ -1381,12 +1426,27 @@ async def _set_dpr_status(db: DB, dpr_id: str, status: str, note: str = "") -> d
     rows = await db.select("dpr_reports", filters={"dpr_id": dpr_id}, limit=1)
     if not rows:
         raise APIError(404, "DPR not found", "DPR_NOT_FOUND")
-    if status == "approved" and rows[0].get("status") == "approved":
+    row = rows[0]
+    prior_status = str(row.get("status") or "pending")
+    if status == "approved" and prior_status == "approved":
         raise APIError(409, "DPR is already approved", "DPR_ALREADY_APPROVED")
     updates = {"status": status}
     if note:
         updates["review_note"] = note
     await db.update("dpr_reports", updates, {"dpr_id": dpr_id})
+
+    if prior_status == "pending" and status in ("approved", "rejected"):
+        employee_id = str(row.get("employee_id") or "")
+        report_date = as_date(row.get("report_date")) or str(row.get("report_date") or "")
+        await notify_dpr_reviewed_to_employee(
+            db,
+            employee_id=employee_id,
+            dpr_id=dpr_id,
+            report_date=report_date,
+            approved=status == "approved",
+            review_note=note,
+        )
+
     return {"dpr_id": dpr_id, "status": status, "review_note": note}
 
 
@@ -1406,19 +1466,67 @@ async def reject_dpr(dpr_id: str, user: dict = Depends(field_user), db: DB = Dep
 
 # --- tour plans -----------------------------------------------------------
 
+def _coerce_bool_flag(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "y")
+    return bool(value)
+
+
+def _normalize_joint_working_seniors(raw) -> list[dict]:
+    if not isinstance(raw, list):
+        return []
+    seniors: list[dict] = []
+    for item in raw:
+        if isinstance(item, str):
+            label = item.strip()
+            if label:
+                seniors.append({"id": label, "name": label, "role": ""})
+            continue
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()
+        senior_id = str(item.get("id") or item.get("employee_id") or "").strip()
+        role = str(item.get("role") or item.get("designation") or "").strip()
+        if not name and not senior_id:
+            continue
+        seniors.append({"id": senior_id or name, "name": name or senior_id, "role": role})
+    return seniors
+
+
 def _tour_view(row: dict) -> dict:
-    payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
+    payload = _dpr_payload_dict(row)
+    seniors = _normalize_joint_working_seniors(
+        payload.get("joint_working_seniors")
+        or row.get("joint_working_seniors")
+        or payload.get("jointWorkingSeniors")
+    )
+    joint_working = _coerce_bool_flag(
+        payload.get("joint_working", payload.get("jointWorking", row.get("joint_working")))
+    )
+    if seniors and not joint_working:
+        joint_working = True
+    objective_ids = payload.get("objective_ids") or []
+    if not objective_ids and row.get("objective_id"):
+        objective_ids = [
+            part.strip()
+            for part in str(row.get("objective_id") or "").split(",")
+            if part.strip()
+        ]
     return {
         "plan_id": row.get("plan_id"),
         "plan_date": as_date(row.get("plan_date")),
         "status": row.get("status") or "draft",
         "selected_areas": row.get("selected_areas") or payload.get("selected_areas") or [],
         "customers": row.get("customers") or payload.get("customers") or [],
-        "objective_ids": payload.get("objective_ids") or ([row.get("objective_id")] if row.get("objective_id") else []),
+        "objective_ids": objective_ids,
         "route": row.get("route") or "",
         "remarks": row.get("remarks") or "",
-        "joint_working": bool(payload.get("joint_working")),
-        "joint_working_seniors": payload.get("joint_working_seniors") or [],
+        "joint_working": joint_working,
+        "joint_working_seniors": seniors,
     }
 
 
@@ -1446,10 +1554,20 @@ async def tour_customers(user: dict = Depends(field_user), db: DB = Depends(get_
 
 
 @router.get("/tour-plans")
-async def tour_month(user: dict = Depends(field_user), db: DB = Depends(get_db), month: str = ""):
+async def tour_month(
+    user: dict = Depends(field_user),
+    db: DB = Depends(get_db),
+    month: str = "",
+    employee_id: str = "",
+    full: str = "",
+):
     month = month or date.today().strftime("%Y-%m")
+    subject = await _resolve_tour_plan_employee_id(db, user, employee_id or None)
+    if full.lower() in ("1", "true", "yes"):
+        plans = await _tour_plan_views_for_month(db, subject, month)
+        return respond("OK", {"month": month, "employee_id": subject, "plans": plans})
     start, end = month_bounds(month)
-    rows = await db.select("tour_plans", filters={"employee_id": user["employee_id"], "plan_date": f"gte.{start}"}, order="plan_date.asc")
+    rows = await db.select("tour_plans", filters={"employee_id": subject, "plan_date": f"gte.{start}"}, order="plan_date.asc")
     items = []
     for row in rows:
         if not in_month(row.get("plan_date"), start, end):
@@ -1465,9 +1583,29 @@ async def tour_month(user: dict = Depends(field_user), db: DB = Depends(get_db),
     return respond("OK", {"month": month, "items": items})
 
 
+async def _tour_plan_views_for_month(db: DB, employee_id: str, month: str) -> list[dict]:
+    start, end = month_bounds(month)
+    rows = await db.select(
+        "tour_plans",
+        filters={"employee_id": employee_id, "plan_date": f"gte.{start}"},
+        order="plan_date.asc",
+    )
+    views = []
+    for row in rows:
+        if in_month(row.get("plan_date"), start, end):
+            views.append(_tour_view(row))
+    return views
+
+
 @router.get("/tour-plans/{plan_date}")
-async def tour_day(plan_date: str, user: dict = Depends(field_user), db: DB = Depends(get_db)):
-    rows = await db.select("tour_plans", filters={"employee_id": user["employee_id"], "plan_date": plan_date}, limit=1)
+async def tour_day(
+    plan_date: str,
+    user: dict = Depends(field_user),
+    db: DB = Depends(get_db),
+    employee_id: str = "",
+):
+    subject = await _resolve_tour_plan_employee_id(db, user, employee_id or None)
+    rows = await db.select("tour_plans", filters={"employee_id": subject, "plan_date": plan_date}, limit=1)
     if not rows:
         return respond("OK", None)
     return respond("OK", _tour_view(rows[0]))
@@ -1543,6 +1681,18 @@ async def submit_tour(body: dict = Body(...), user: dict = Depends(field_user), 
         await db.update("approval_requests", approval, {"approval_id": approval_id})
     else:
         await db.insert("approval_requests", approval)
+
+    manager_id = str(manager_fields.get("forwarded_to") or "").strip()
+    if manager_id:
+        me = await _user_row(db, user["employee_id"])
+        await notify_tour_submitted_to_manager(
+            db,
+            submitter_name=str(me.get("name") or user["employee_id"]),
+            manager_employee_id=manager_id,
+            approval_id=approval_id,
+            plan_label=str(saved["plan_date"]),
+        )
+
     return respond("Submitted for approval", {"plan_id": saved["plan_id"], "status": "pending", "approval_id": approval_id})
 
 
@@ -1571,43 +1721,42 @@ async def _ensure_tour_approval_rows_for_month(
     month: str,
     manager_fields: dict[str, str],
 ) -> int:
-    """Create missing approval_requests for pending days (fixes DB rows with no senior queue entry)."""
-    start, end = month_bounds(month)
-    rows = await db.select("tour_plans", filters={"employee_id": employee_id, "plan_date": f"gte.{start}"})
-    repaired = 0
+    """Ensure monthly approval row has approver fields (no per-day queue rows)."""
     monthly_id = f"APR-MONTH-{employee_id}-{month}"
     await _patch_approval_manager_fields(db, monthly_id, manager_fields)
+    return 0
 
-    for row in rows:
-        if not in_month(row.get("plan_date"), start, end):
+
+def _tour_queue_month(row: dict) -> str:
+    approval_id = str(row.get("approval_id") or "")
+    from_id = _month_key_from_monthly_approval_id(approval_id)
+    if from_id:
+        return from_id
+    request_date = str(row.get("request_date") or "")
+    return request_date[:7] if len(request_date) >= 7 else ""
+
+
+def _collapse_tour_approval_queue(items: list[dict]) -> list[dict]:
+    """One pending row per employee per month; prefer monthly approval_id."""
+    grouped: dict[tuple[str, str], dict] = {}
+    for item in items:
+        employee_id = str(item.get("employee_id") or "").strip()
+        month = str(item.get("month") or "").strip()
+        if not employee_id or not month:
             continue
-        if row.get("status") != "pending":
+        key = (employee_id.lower(), month)
+        existing = grouped.get(key)
+        approval_id = str(item.get("approval_id") or "")
+        if existing is None:
+            grouped[key] = item
             continue
-        plan_id = row.get("plan_id")
-        if not plan_id:
-            continue
-        aid = f"APR-{plan_id}"
-        existing = await db.select("approval_requests", filters={"approval_id": aid}, limit=1)
-        if existing:
-            await _patch_approval_manager_fields(db, aid, manager_fields)
-            continue
-        await db.insert(
-            "approval_requests",
-            {
-                "approval_id": aid,
-                "employee_id": employee_id,
-                "request_type": "tour",
-                "request_date": as_date(row.get("plan_date")) or start,
-                "submitted_time": row.get("submitted_time") or clock_label(),
-                "status": "pending",
-                "sla": "24h",
-                "details": f"Tour plan {row.get('plan_date')}",
-                "tour_type": "Daily Tour Plan",
-                **manager_fields,
-            },
-        )
-        repaired += 1
-    return repaired
+        if "APR-MONTH" in approval_id:
+            grouped[key] = item
+        elif "APR-MONTH" not in str(existing.get("approval_id") or ""):
+            grouped[key] = item
+    collapsed = list(grouped.values())
+    collapsed.sort(key=lambda row: (row.get("month") or "", row.get("submitted_at") or ""), reverse=True)
+    return collapsed
 
 
 @router.post("/tour-plans/submit-month")
@@ -1643,6 +1792,18 @@ async def submit_month(body: dict = Body(...), user: dict = Depends(field_user),
         await db.update("approval_requests", approval, {"approval_id": approval_id})
     else:
         await db.insert("approval_requests", approval)
+
+    manager_id = str(manager_fields.get("forwarded_to") or "").strip()
+    if manager_id:
+        me = await _user_row(db, user["employee_id"])
+        await notify_tour_submitted_to_manager(
+            db,
+            submitter_name=str(me.get("name") or user["employee_id"]),
+            manager_employee_id=manager_id,
+            approval_id=approval_id,
+            plan_label=month,
+        )
+
     repaired = await _ensure_tour_approval_rows_for_month(
         db, user["employee_id"], month, manager_fields
     )
@@ -1666,12 +1827,18 @@ async def submit_month(body: dict = Body(...), user: dict = Depends(field_user),
 
 def _tour_queue_item(row: dict, names: dict[str, dict]) -> dict:
     person = names.get(row.get("employee_id")) or {}
+    employee_id = str(row.get("employee_id") or "")
+    month = _tour_queue_month(row)
+    approval_id = str(row.get("approval_id") or "")
+    if month and employee_id and not approval_id.startswith("APR-MONTH-"):
+        approval_id = f"APR-MONTH-{employee_id}-{month}"
     return {
-        "approval_id": row.get("approval_id"),
-        "employee_id": row.get("employee_id"),
+        "approval_id": approval_id,
+        "employee_id": employee_id,
         "employee_name": person.get("name") or "",
         "profile_image_url": person.get("profile_image_url") or "",
-        "month": str(row.get("request_date") or "")[:7],
+        "territory": person.get("territory") or "",
+        "month": month,
         "status": row.get("status") or "pending",
         "submitted_at": row.get("applied_at") or row.get("submitted_time"),
         "details": row.get("details") or "",
@@ -1687,46 +1854,114 @@ async def tour_approvals(user: dict = Depends(field_user), db: DB = Depends(get_
     people = await db.select("users")
     rows = await db.select("approval_requests", filters={"request_type": "tour"}, order="request_date.desc")
     names = {row.get("employee_id"): row for row in people}
+    pending_monthly: set[tuple[str, str]] = set()
+    for row in rows:
+        if status and (row.get("status") or "") != status:
+            continue
+        approval_id = str(row.get("approval_id") or "")
+        if not approval_id.startswith("APR-MONTH-"):
+            continue
+        employee_id = str(row.get("employee_id") or "").strip()
+        month = _tour_queue_month(row)
+        if employee_id and month:
+            pending_monthly.add((employee_id.lower(), month))
     items = []
     for row in rows:
         if not _manager_can_see_tour_approval(row, manager_id, manager_name, direct_reports):
             continue
         if status and (row.get("status") or "") != status:
             continue
+        approval_id = str(row.get("approval_id") or "")
+        if not approval_id.startswith("APR-MONTH-"):
+            employee_id = str(row.get("employee_id") or "").strip()
+            month = _tour_queue_month(row)
+            if employee_id and month and (employee_id.lower(), month) in pending_monthly:
+                continue
         items.append(_tour_queue_item(row, names))
+    items = _collapse_tour_approval_queue(items)
     return respond("OK", {"items": items})
 
 
-@router.get("/tour-approvals/{approval_id}")
-async def tour_approval_detail(approval_id: str, user: dict = Depends(field_user), db: DB = Depends(get_db)):
-    del user
+async def _can_view_tour_approval(db: DB, approval: dict, user: dict) -> bool:
+    if _employee_ids_equal(approval.get("employee_id"), user["employee_id"]):
+        return True
+    me = await _user_row(db, user["employee_id"])
+    direct_reports = await _direct_report_ids(db, user["employee_id"])
+    return _manager_can_see_tour_approval(
+        approval, user["employee_id"], me.get("name") or "", direct_reports
+    )
+
+
+def _month_key_from_monthly_approval_id(approval_id: str) -> str | None:
+    if not approval_id.startswith("APR-MONTH-"):
+        return None
+    parts = approval_id.split("-")
+    if len(parts) >= 2 and len(parts[-2]) == 4 and parts[-2].isdigit() and parts[-1].isdigit():
+        return f"{parts[-2]}-{parts[-1]}"
+    return None
+
+
+@router.get("/tour-approvals/{approval_id}/plans")
+async def tour_approval_plans(
+    approval_id: str, user: dict = Depends(field_user), db: DB = Depends(get_db)
+):
     rows = await db.select("approval_requests", filters={"approval_id": approval_id}, limit=1)
     if not rows:
         raise APIError(404, "Tour approval not found", "NOT_FOUND")
     approval = rows[0]
+    if not await _can_view_tour_approval(db, approval, user):
+        raise APIError(403, "You cannot view this tour approval", "FORBIDDEN")
+    month = str(approval.get("request_date") or "")[:7]
+    if len(month) != 7:
+        month = _month_key_from_monthly_approval_id(approval_id) or month
+    employee_id = str(approval.get("employee_id") or "")
+    plans = await _tour_plan_views_for_month(db, employee_id, month) if len(month) == 7 else []
+    return respond(
+        "OK",
+        {"approval_id": approval_id, "month": month, "employee_id": employee_id, "plans": plans},
+    )
+
+
+@router.get("/tour-approvals/{approval_id}")
+async def tour_approval_detail(approval_id: str, user: dict = Depends(field_user), db: DB = Depends(get_db)):
+    rows = await db.select("approval_requests", filters={"approval_id": approval_id}, limit=1)
+    if not rows:
+        raise APIError(404, "Tour approval not found", "NOT_FOUND")
+    approval = rows[0]
+    if not await _can_view_tour_approval(db, approval, user):
+        raise APIError(403, "You cannot view this tour approval", "FORBIDDEN")
     names = await _name_map(db)
     person = names.get(approval.get("employee_id")) or {}
     month = str(approval.get("request_date") or "")[:7]
-    plans = await db.select("tour_plans", filters={"employee_id": approval.get("employee_id")}, order="plan_date.asc")
-    if len(month) == 7:
-        start, end = month_bounds(month)
-        plans = [row for row in plans if in_month(row.get("plan_date"), start, end)]
+    if len(month) != 7:
+        month = _month_key_from_monthly_approval_id(approval_id) or month
+    employee_id = str(approval.get("employee_id") or "")
+    plan_items = await _tour_plan_views_for_month(db, employee_id, month) if len(month) == 7 else []
     days = []
-    for row in plans:
-        view = _tour_view(row)
-        days.append({
-            "plan_id": view["plan_id"],
-            "plan_date": view["plan_date"],
-            "status": view["status"],
-            "areas": [area.get("name") for area in view["selected_areas"] if isinstance(area, dict)],
-            "customers": [customer.get("name") for customer in view["customers"] if isinstance(customer, dict)],
-        })
+    for view in plan_items:
+        days.append(
+            {
+                "plan_id": view["plan_id"],
+                "plan_date": view["plan_date"],
+                "status": view["status"],
+                "areas": [area.get("name") for area in view["selected_areas"] if isinstance(area, dict)],
+                "customers": [customer.get("name") for customer in view["customers"] if isinstance(customer, dict)],
+                "joint_working": view.get("joint_working"),
+                "joint_working_seniors": view.get("joint_working_seniors") or [],
+            }
+        )
     return respond("OK", {
         "approval_id": approval_id,
         "status": approval.get("status"),
-        "employee": {"employee_id": approval.get("employee_id"), "name": person.get("name") or "", "territory": person.get("territory") or ""},
+        "employee": {
+            "employee_id": approval.get("employee_id"),
+            "name": person.get("name") or "",
+            "territory": person.get("territory") or "",
+            "profile_image_url": person.get("profile_image_url") or "",
+        },
         "month": month,
         "days": days,
+        "plans": plan_items,
     })
 
 
@@ -1735,10 +1970,29 @@ async def _review_tour(db: DB, approval_id: str, status: str, note: str = "") ->
     if not rows:
         raise APIError(404, "Tour approval not found", "NOT_FOUND")
     approval = rows[0]
+    prior_status = str(approval.get("status") or "pending")
     updates = {"status": status}
     if note:
         updates["review_note"] = note
     await db.update("approval_requests", updates, {"approval_id": approval_id})
+
+    if (
+        prior_status == "pending"
+        and status in ("approved", "rejected")
+        and str(approval.get("request_type") or "") == "tour"
+    ):
+        month = str(approval.get("request_date") or "")[:7]
+        plan_label = month if len(month) == 7 else str(approval.get("request_date") or approval_id)
+        if approval.get("tour_type") == "Daily Tour Plan":
+            plan_label = str(approval.get("request_date") or plan_label)
+        await notify_tour_reviewed_to_employee(
+            db,
+            employee_id=str(approval.get("employee_id") or ""),
+            approval_id=approval_id,
+            plan_label=plan_label,
+            approved=status == "approved",
+            review_note=note,
+        )
     month = str(approval.get("request_date") or "")[:7]
     plans = await db.select("tour_plans", filters={"employee_id": approval.get("employee_id")})
     updated = 0
@@ -1763,8 +2017,67 @@ async def approve_tour(approval_id: str, user: dict = Depends(field_user), db: D
 @router.post("/tour-approvals/{approval_id}/reject")
 async def reject_tour(approval_id: str, body: dict = Body(default={}), user: dict = Depends(field_user), db: DB = Depends(get_db)):
     del user
-    data = await _review_tour(db, approval_id, "rejected", str(body.get("review_note") or ""))
+    note = str(body.get("review_note") or "").strip()
+    if not note:
+        raise APIError(422, "Rejection reason is required", "VALIDATION_ERROR")
+    data = await _review_tour(db, approval_id, "rejected", note)
     return respond("Tour plan rejected", data)
+
+
+async def _assert_manager_tour_approval(
+    db: DB, approval_id: str, manager_employee_id: str, manager_name: str
+) -> dict:
+    rows = await db.select("approval_requests", filters={"approval_id": approval_id}, limit=1)
+    if not rows:
+        raise APIError(404, "Tour approval not found", "NOT_FOUND")
+    approval = rows[0]
+    direct_reports = await _direct_report_ids(db, manager_employee_id)
+    if not _manager_can_see_tour_approval(approval, manager_employee_id, manager_name, direct_reports):
+        raise APIError(403, "You cannot act on this tour approval", "FORBIDDEN")
+    return approval
+
+
+@router.post("/tour-approvals/{approval_id}/forward")
+async def forward_tour(
+    approval_id: str,
+    body: dict = Body(...),
+    user: dict = Depends(field_user),
+    db: DB = Depends(get_db),
+):
+    me = await _user_row(db, user["employee_id"])
+    approval = await _assert_manager_tour_approval(
+        db, approval_id, user["employee_id"], me.get("name") or ""
+    )
+    fields = _reporting_manager_from_body(body)
+    if not fields.get("forwarded_to"):
+        raise APIError(
+            422,
+            "Select a senior manager to forward to",
+            "VALIDATION_ERROR",
+        )
+    if _employee_ids_equal(fields["forwarded_to"], user["employee_id"]):
+        raise APIError(422, "Cannot forward to yourself", "VALIDATION_ERROR")
+    patch = {
+        "forwarded_to": fields["forwarded_to"],
+        "forwarded_to_name": fields.get("forwarded_to_name") or "",
+        "status": "pending",
+        "updated_at": now_iso(),
+    }
+    await db.update("approval_requests", patch, {"approval_id": approval_id})
+    employee_id = approval.get("employee_id")
+    month = str(approval.get("request_date") or "")[:7]
+    if employee_id and len(month) == 7:
+        monthly_id = f"APR-MONTH-{employee_id}-{month}"
+        if monthly_id != approval_id:
+            await db.update("approval_requests", patch, {"approval_id": monthly_id})
+    return respond(
+        "Forwarded to senior",
+        {
+            "approval_id": approval_id,
+            "forwarded_to": fields["forwarded_to"],
+            "forwarded_to_name": fields.get("forwarded_to_name") or "",
+        },
+    )
 
 
 # --- POB, products, cabinet ----------------------------------------------
@@ -2056,7 +2369,11 @@ async def apply_leave(body: dict = Body(...), user: dict = Depends(field_user), 
         if other_from and not (end < other_from or start > other_to):
             raise APIError(409, "Leave dates overlap an existing request", "OVERLAP")
     approval_id = new_id("APR")
-    await db.insert("approval_requests", {
+    manager_fields = await _manager_fields_for_tour_submit(db, user["employee_id"], body)
+    person = await _user_row(db, user["employee_id"])
+    submitter_name = str(person.get("name") or user["employee_id"])
+    date_range = start if start == end or not end else f"{start} – {end}"
+    leave_row = {
         "approval_id": approval_id,
         "employee_id": user["employee_id"],
         "request_type": "leave",
@@ -2072,7 +2389,21 @@ async def apply_leave(body: dict = Body(...), user: dict = Depends(field_user), 
         "leave_type": leave_type,
         "applied_at": now_iso(),
         "updated_at": now_iso(),
-    })
+        **manager_fields,
+    }
+    await db.insert("approval_requests", leave_row)
+
+    manager_id = str(manager_fields.get("forwarded_to") or "").strip()
+    if manager_id:
+        await notify_leave_submitted_to_manager(
+            db,
+            submitter_name=submitter_name,
+            manager_employee_id=manager_id,
+            approval_id=approval_id,
+            leave_label=str(leave_type).replace("_", " ").title(),
+            date_range=date_range,
+        )
+
     return respond("Leave submitted", {
         "approval_id": approval_id,
         "status": "pending",
@@ -2088,7 +2419,23 @@ async def _review_leave(db: DB, approval_id: str, status: str, note: str = "") -
     if not rows or rows[0].get("request_type") != "leave":
         raise APIError(404, "Leave request not found", "NOT_FOUND")
     row = rows[0]
+    prior_status = str(row.get("status") or "pending")
     await db.update("approval_requests", {"status": status, "review_note": note, "updated_at": now_iso()}, {"approval_id": approval_id})
+
+    if prior_status == "pending" and status in ("approved", "rejected"):
+        start = as_date(row.get("leave_from")) or ""
+        end = as_date(row.get("leave_to")) or start
+        date_range = start if not end or start == end else f"{start} – {end}"
+        leave_type = str(row.get("leave_type") or "leave").replace("_", " ").title()
+        await notify_leave_reviewed_to_employee(
+            db,
+            employee_id=str(row.get("employee_id") or ""),
+            approval_id=approval_id,
+            leave_label=leave_type,
+            date_range=date_range,
+            approved=status == "approved",
+            review_note=note,
+        )
     balance_view = None
     if status == "approved" and row.get("status") != "approved":
         leave_type = row.get("leave_type") or "casual_leave"

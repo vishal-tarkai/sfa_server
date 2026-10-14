@@ -64,6 +64,8 @@ def supabase_credentials() -> tuple[str, str]:
 
 reload_env_files()
 SUPABASE_URL, SUPABASE_ANON_KEY = supabase_credentials()
+# Optional: FCM via Supabase Edge `send-fcm-notification` (see CMS/.env.example).
+FCM_WEBHOOK_SECRET = _first_env("FCM_WEBHOOK_SECRET")
 HOST = os.environ.get("HOST", "127.0.0.1")
 PORT = int(os.environ.get("PORT", "8080"))
 
