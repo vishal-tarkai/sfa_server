@@ -480,19 +480,50 @@ async def logout(user: dict = Depends(field_user)):
     return respond("Logged out successfully", None)
 
 
+async def _persist_fcm_token(
+    db: DB,
+    *,
+    employee_id: str,
+    token: str,
+    platform: str,
+) -> None:
+    """Save device token to user_fcm_tokens (and users.fcm_token when that column exists)."""
+    users = await db.select("users", filters={"employee_id": employee_id}, limit=1)
+    if not users:
+        raise APIError(404, "User not found", "NOT_FOUND")
+
+    payload = {
+        "fcm_token": token,
+        "employee_id": employee_id,
+        "platform": (platform or "unknown").strip().lower() or "unknown",
+        "updated_at": now_iso(),
+    }
+    await db.upsert("user_fcm_tokens", payload, "fcm_token")
+
+    try:
+        await db.update("users", {"fcm_token": token}, {"employee_id": employee_id})
+    except APIError as error:
+        # Older DBs may lack users.fcm_token; push still works via user_fcm_tokens.
+        if error.code not in ("NOT_FOUND", "SERVICE_UNAVAILABLE"):
+            msg = str(error.message or "").lower()
+            if "fcm_token" not in msg and "column" not in msg:
+                raise
+
+
 @router.post("/auth/fcm-token")
 async def register_fcm(body: dict = Body(...), user: dict = Depends(field_user), db: DB = Depends(get_db)):
-    token = str(body.get("token") or "").strip()
+    token = str(body.get("token") or body.get("fcm_token") or "").strip()
     if not token:
         raise APIError(422, "Token is required", "VALIDATION_ERROR", {"token": ["Token is required"]})
-    platform = body.get("platform") or "android"
-    await db.upsert("user_fcm_tokens", {
-        "fcm_token": token,
-        "employee_id": user["employee_id"],
-        "platform": platform,
-        "updated_at": now_iso(),
-    }, "fcm_token")
-    return respond("Token registered", {"employee_id": user["employee_id"], "token": token, "platform": platform})
+    platform = str(body.get("platform") or "android").strip().lower() or "android"
+    employee_id = str(user.get("employee_id") or "").strip()
+    if not employee_id:
+        raise APIError(401, "Invalid session", "UNAUTHORIZED")
+    await _persist_fcm_token(db, employee_id=employee_id, token=token, platform=platform)
+    return respond(
+        "Token registered",
+        {"employee_id": employee_id, "token": token, "platform": platform},
+    )
 
 
 @router.delete("/auth/fcm-token")
