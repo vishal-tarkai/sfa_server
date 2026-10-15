@@ -451,6 +451,10 @@ def entity_card(row: dict, stockist_name: str = "") -> dict:
         "stockist_name": stockist_name,
         "latitude": row.get("latitude"),
         "longitude": row.get("longitude"),
+        "location_note": row.get("location_note") or "",
+        "gps_accuracy_m": row.get("gps_accuracy_m"),
+        "gps_status": row.get("gps_status") or "",
+        "gps_verified_at": row.get("gps_verified_at") or "",
     }
 
 

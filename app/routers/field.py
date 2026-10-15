@@ -759,24 +759,60 @@ async def schedule(user: dict = Depends(field_user), db: DB = Depends(get_db), d
 
 
 @router.get("/dashboard/proximity")
-async def proximity(user: dict = Depends(field_user), db: DB = Depends(get_db), lat: float = Query(...), lng: float = Query(...)):
-    del user
+async def proximity(
+    user: dict = Depends(field_user),
+    db: DB = Depends(get_db),
+    lat: float = Query(...),
+    lng: float = Query(...),
+    radius_km: float = Query(default=0.0),
+    limit: int = Query(default=500, ge=1, le=2000),
+    territory: str = "",
+):
+    employee_id = user.get("employee_id") or ""
+    territory = (territory or user.get("territory") or "").strip()
     rows = await db.select("healthcare_entities", filters={"status": "active"})
     items = []
     for row in rows:
-        elat, elng = row.get("latitude"), row.get("longitude")
-        if elat is None or elng is None:
+        if not entity_visible_for_territory(
+            row.get("territory"),
+            territory,
+            employee_id=employee_id,
+            assigned_employee_id=row.get("assigned_employee_id"),
+        ):
             continue
+        elat, elng = row.get("latitude"), row.get("longitude")
+        has_coords = elat is not None and elng is not None
+        distance_m = None
+        if has_coords:
+            distance_m = round(haversine_m(lat, lng, num(elat), num(elng)))
+            if radius_km > 0 and distance_m > radius_km * 1000:
+                continue
+        specialty = row.get("specialty") or ""
+        hospital = row.get("hospital") or ""
+        subtitle = " · ".join(part for part in (specialty, hospital) if part)
+        gps_status = (row.get("gps_status") or "").strip() or (
+            "pending" if not has_coords else "verified"
+        )
         items.append({
             "id": row.get("entity_id"),
             "name": row.get("name"),
-            "type": row.get("type"),
-            "latitude": num(elat),
-            "longitude": num(elng),
-            "distance_m": round(haversine_m(lat, lng, num(elat), num(elng))),
+            "subtitle": subtitle,
+            "type": norm_entity_type(row.get("type")) or row.get("type"),
+            "phone": row.get("phone") or "",
+            "latitude": num(elat) if has_coords else None,
+            "longitude": num(elng) if has_coords else None,
+            "distance_m": distance_m,
+            "gps_status": gps_status,
+            "location_note": row.get("location_note") or "",
+            "gps_accuracy_m": row.get("gps_accuracy_m"),
         })
-    items.sort(key=lambda item: item["distance_m"])
-    return respond("OK", {"items": items[:50]})
+    items.sort(
+        key=lambda item: (
+            item["distance_m"] is None,
+            item["distance_m"] if item["distance_m"] is not None else 0,
+        )
+    )
+    return respond("OK", {"items": items[:limit]})
 
 
 async def _celebration_items(db: DB) -> list[dict]:
@@ -1152,11 +1188,73 @@ async def create_entity(body: dict = Body(...), user: dict = Depends(field_user)
     return respond("Entity created", entity_card(saved[0] if saved else row), 201)
 
 
+@router.patch("/network/entities/{entity_id}/location")
+async def update_entity_location(
+    entity_id: str,
+    body: dict = Body(...),
+    user: dict = Depends(field_user),
+    db: DB = Depends(get_db),
+):
+    del user
+    allowed_status = {"pending", "verified", "approximated", "geo_tag"}
+    gps_status = (body.get("gps_status") or "verified").strip()
+    if gps_status not in allowed_status:
+        raise APIError(400, "Invalid gps_status", "VALIDATION_ERROR")
+
+    updates: dict[str, Any] = {"gps_status": gps_status}
+    if "latitude" in body:
+        updates["latitude"] = num(body["latitude"])
+    if "longitude" in body:
+        updates["longitude"] = num(body["longitude"])
+    if "gps_accuracy_m" in body:
+        updates["gps_accuracy_m"] = num(body["gps_accuracy_m"])
+    if "location_note" in body:
+        updates["location_note"] = body.get("location_note") or ""
+    if "latitude" in updates and "longitude" in updates:
+        updates["gps_verified_at"] = datetime.now(timezone.utc).isoformat()
+
+    saved = await db.update("healthcare_entities", updates, {"entity_id": entity_id})
+    if not saved:
+        raise APIError(404, "Entity not found", "NOT_FOUND")
+    row = saved[0]
+    stockist = ""
+    if row.get("stockist_id"):
+        linked = await db.select(
+            "healthcare_entities",
+            filters={"entity_id": row["stockist_id"]},
+            limit=1,
+        )
+        stockist = linked[0].get("name") if linked else ""
+    return respond("GPS coordinates saved", entity_card(row, stockist))
+
+
 @router.patch("/network/entities/{entity_id}")
 async def update_entity(entity_id: str, body: dict = Body(...), user: dict = Depends(field_user), db: DB = Depends(get_db)):
     del user
-    allowed = ("name", "type", "specialty", "territory", "city", "phone", "status", "hospital", "tier", "dob", "anniversary", "stockist_id")
+    allowed = (
+        "name",
+        "type",
+        "specialty",
+        "territory",
+        "city",
+        "phone",
+        "status",
+        "hospital",
+        "tier",
+        "dob",
+        "anniversary",
+        "stockist_id",
+        "latitude",
+        "longitude",
+        "location_note",
+        "gps_accuracy_m",
+        "gps_status",
+    )
     updates = {key: body[key] for key in allowed if key in body}
+    if "latitude" in updates and "longitude" in updates:
+        updates["gps_verified_at"] = datetime.now(timezone.utc).isoformat()
+        if "gps_status" not in updates:
+            updates["gps_status"] = "verified"
     saved = await db.update("healthcare_entities", updates, {"entity_id": entity_id})
     if not saved:
         raise APIError(404, "Entity not found", "NOT_FOUND")
@@ -2724,6 +2822,25 @@ def _leave_item(row: dict) -> dict:
     }
 
 
+def _leave_balance_column(leave_type: str) -> str:
+    return {
+        "casual_leave": "casual_leave",
+        "earned_leave": "earned_leave",
+        "medical_leave": "medical_leave",
+        "compensatory_leave": "compensatory_leave",
+        "cl": "casual_leave",
+        "el": "earned_leave",
+        "ml": "medical_leave",
+        "cpl": "compensatory_leave",
+    }.get((leave_type or "").strip().lower(), "casual_leave")
+
+
+def _leave_remaining(balance: dict, leave_type: str) -> float:
+    """`leave_balances.*` columns store remaining days (admin deducts on approve)."""
+    column = _leave_balance_column(leave_type)
+    return num(balance.get(column))
+
+
 async def _balance(db: DB, employee_id: str) -> dict:
     rows = await db.select("leave_balances", filters={"employee_id": employee_id}, limit=1)
     if not rows:
@@ -2767,17 +2884,15 @@ async def apply_leave(body: dict = Body(...), user: dict = Depends(field_user), 
     leave_type = body.get("leave_type") or "casual_leave"
     start = body.get("from_date") or today_str()
     end = body.get("to_date") or start
-    days = int(num(body.get("days"))) or (date.fromisoformat(end) - date.fromisoformat(start)).days + 1
+    days = num(body.get("days"))
+    if days <= 0:
+        days = float((date.fromisoformat(end) - date.fromisoformat(start)).days + 1)
     balance = await _balance(db, user["employee_id"])
-    column = {
-        "casual_leave": "casual_leave",
-        "earned_leave": "earned_leave",
-        "medical_leave": "medical_leave",
-        "compensatory_leave": "compensatory_leave",
-    }.get(leave_type, "casual_leave")
-    remaining = num(balance.get(column)) - num(balance.get(f"{column}_used"))
-    if days > remaining:
-        raise APIError(409, "Not enough leave balance", "INSUFFICIENT_BALANCE")
+    column = _leave_balance_column(leave_type)
+    remaining = _leave_remaining(balance, leave_type)
+    if column in ("casual_leave", "earned_leave", "medical_leave", "compensatory_leave"):
+        if days > remaining:
+            raise APIError(409, "Not enough leave balance", "INSUFFICIENT_BALANCE")
     existing = await db.select("approval_requests", filters={"employee_id": user["employee_id"], "request_type": "leave"})
     for row in existing:
         if row.get("status") not in ("pending", "approved"):
@@ -2855,15 +2970,22 @@ async def _review_leave(db: DB, approval_id: str, status: str, note: str = "") -
             review_note=note,
         )
     balance_view = None
-    if status == "approved" and row.get("status") != "approved":
+    if status == "approved" and prior_status != "approved":
         leave_type = row.get("leave_type") or "casual_leave"
-        used_col = f"{leave_type}_used" if leave_type.endswith("_leave") else "casual_leave_used"
-        if not used_col.endswith("_used"):
-            used_col = "casual_leave_used"
+        balance_col = _leave_balance_column(leave_type)
+        used_col = f"{balance_col}_used"
+        days = num(row.get("leave_days"))
         balance = await _balance(db, row.get("employee_id"))
-        new_used = num(balance.get(used_col)) + num(row.get("leave_days"))
-        await db.update("leave_balances", {used_col: new_used}, {"employee_id": row.get("employee_id")})
-        balance_view = {leave_type: num(balance.get(leave_type)), used_col: new_used}
+        remaining = num(balance.get(balance_col))
+        used = num(balance.get(used_col))
+        new_remaining = max(0.0, remaining - days)
+        new_used = used + days
+        await db.update(
+            "leave_balances",
+            {balance_col: new_remaining, used_col: new_used},
+            {"employee_id": row.get("employee_id")},
+        )
+        balance_view = {balance_col: new_remaining, used_col: new_used}
     return {"approval_id": approval_id, "status": status, "review_note": note, "balance": balance_view}
 
 
