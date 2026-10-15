@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
@@ -22,8 +23,9 @@ from app.db import DB
 from app.deps import get_db
 from app.errors import APIError, respond
 from app.notifications import (
+    notify_dpr_joint_working_tagged,
     notify_dpr_reviewed_to_employee,
-    notify_dpr_submitted_to_manager,
+    notify_dpr_submitted_to_seniors,
     notify_expense_reviewed_to_employee,
     notify_expense_submitted_to_seniors,
     notify_leave_reviewed_to_employee,
@@ -1321,6 +1323,240 @@ def _dpr_flat_visits(body: dict) -> tuple[list, list, list]:
     return body.get("doctors") or [], body.get("parties") or [], body.get("cme_other") or []
 
 
+def _visit_is_joint_for_senior(visit: dict, senior_id: str) -> bool:
+    if not isinstance(visit, dict) or not visit.get("joint_working"):
+        return False
+    seniors = _normalize_joint_working_seniors(visit.get("joint_working_seniors"))
+    return any(_employee_ids_equal(s.get("id"), senior_id) for s in seniors)
+
+
+def _extract_joint_working_seniors(body: dict) -> list[dict]:
+    top = _normalize_joint_working_seniors(body.get("joint_working_seniors"))
+    if top:
+        return top
+    by_id: dict[str, dict] = {}
+    doctors, parties, _ = _dpr_flat_visits(body)
+    for entry in doctors + parties:
+        visit = entry.get("visit") if isinstance(entry.get("visit"), dict) else {}
+        if not visit.get("joint_working"):
+            continue
+        for senior in _normalize_joint_working_seniors(visit.get("joint_working_seniors")):
+            sid = str(senior.get("id") or "").strip()
+            if sid:
+                by_id[sid] = senior
+    return list(by_id.values())
+
+
+def _joint_entries_for_senior(body: dict, senior_id: str) -> tuple[list, list]:
+    doctors, parties, _ = _dpr_flat_visits(body)
+    jdocs = [
+        entry
+        for entry in doctors
+        if _visit_is_joint_for_senior(entry.get("visit") or {}, senior_id)
+    ]
+    jparties = [
+        entry
+        for entry in parties
+        if _visit_is_joint_for_senior(entry.get("visit") or {}, senior_id)
+    ]
+    return jdocs, jparties
+
+
+def _copy_joint_entry(entry: dict, submitter_id: str, submitter_name: str) -> dict:
+    copied = copy.deepcopy(entry)
+    raw_eid = str(copied.get("entry_id") or copied.get("entity_id") or "visit")
+    copied["entry_id"] = f"JW-{submitter_id}-{raw_eid}"[:96]
+    visit = copy.deepcopy(copied.get("visit") or {})
+    visit["joint_working"] = True
+    remarks = str(visit.get("remarks") or "").strip()
+    prefix = f"Joint with {submitter_name}."
+    visit["remarks"] = f"{prefix} {remarks}".strip() if remarks else prefix
+    copied["visit"] = visit
+    return copied
+
+
+async def _append_dpr_visit_rows(
+    db: DB,
+    dpr_id: str,
+    doctors: list,
+    parties: list,
+    start_order: int,
+) -> int:
+    order = start_order
+    for entry in doctors + parties:
+        entry_id = entry.get("entry_id") or entry.get("entity_id") or str(order)
+        visit = entry.get("visit") if isinstance(entry.get("visit"), dict) else {}
+        await db.insert(
+            "dpr_visit_details",
+            {
+                "visit_id": f"{dpr_id}-{entry_id}",
+                "dpr_id": dpr_id,
+                "visit_time": clock_label(),
+                "entity_name": entry.get("entity_name") or entry.get("name") or "",
+                "entity_type": entry.get("entity_type") or entry.get("type") or "doctor",
+                "latitude": 0,
+                "longitude": 0,
+                "location_label": entry.get("station_name") or "",
+                "notes": visit.get("remarks") or entry.get("remarks") or "",
+                "sort_order": order,
+                "duration": visit.get("duration") or "—",
+                "status": "completed",
+            },
+        )
+        order += 1
+    return order
+
+
+async def _sync_joint_working_to_senior_dprs(
+    db: DB,
+    *,
+    submitter_id: str,
+    submitter_name: str,
+    report_date: str,
+    source_dpr_id: str,
+    body: dict,
+) -> None:
+    seniors = _extract_joint_working_seniors(body)
+    for senior in seniors:
+        senior_id = str(senior.get("id") or "").strip()
+        if not senior_id or _employee_ids_equal(senior_id, submitter_id):
+            continue
+        jdocs, jparties = _joint_entries_for_senior(body, senior_id)
+        if not jdocs and not jparties:
+            continue
+
+        copied_docs = [_copy_joint_entry(e, submitter_id, submitter_name) for e in jdocs]
+        copied_parties = [_copy_joint_entry(e, submitter_id, submitter_name) for e in jparties]
+
+        existing = await db.select(
+            "dpr_reports",
+            filters={"employee_id": senior_id, "report_date": report_date},
+            limit=1,
+        )
+        person = await _user_row(db, senior_id)
+        if existing:
+            row = existing[0]
+            dpr_id = str(row.get("dpr_id") or "")
+            payload = _dpr_payload_dict(row)
+            payload_doctors = list(payload.get("doctors") or [])
+            payload_parties = list(payload.get("parties") or [])
+            existing_ids = {
+                str(e.get("entry_id") or "")
+                for e in payload_doctors + payload_parties
+            }
+            for entry in copied_docs:
+                eid = str(entry.get("entry_id") or "")
+                if eid and eid not in existing_ids:
+                    payload_doctors.append(entry)
+                    existing_ids.add(eid)
+            for entry in copied_parties:
+                eid = str(entry.get("entry_id") or "")
+                if eid and eid not in existing_ids:
+                    payload_parties.append(entry)
+                    existing_ids.add(eid)
+            payload["doctors"] = payload_doctors
+            payload["parties"] = payload_parties
+            payload["joint_working"] = True
+            jw_seniors = _normalize_joint_working_seniors(payload.get("joint_working_seniors"))
+            jw_ids = {str(s.get("id") or "") for s in jw_seniors}
+            if submitter_id not in jw_ids:
+                jw_seniors.append(
+                    {
+                        "id": submitter_id,
+                        "name": submitter_name,
+                        "role": "",
+                    }
+                )
+            payload["joint_working_seniors"] = jw_seniors
+            summary = (
+                f"DPR {report_date} — {len(payload_doctors)} doctor(s) — "
+                f"{len(payload_parties)} party visit(s)"
+            )
+            await db.update(
+                "dpr_reports",
+                {
+                    "doctor_calls": len(payload_doctors),
+                    "chemist_visits": len(payload_parties),
+                    "details": summary,
+                    "payload": payload,
+                },
+                {"dpr_id": dpr_id},
+            )
+            visit_rows = await db.select(
+                "dpr_visit_details",
+                filters={"dpr_id": dpr_id},
+                order="sort_order.asc",
+            )
+            next_order = (max((r.get("sort_order") or 0) for r in visit_rows) if visit_rows else 0) + 1
+            await _append_dpr_visit_rows(db, dpr_id, copied_docs, copied_parties, next_order)
+        else:
+            dpr_id = new_id("DPR")
+            field_areas = _dpr_field_areas(body)
+            payload = {
+                "schema_version": body.get("schema_version") or "1.1",
+                "dpr_id": dpr_id,
+                "status": "pending",
+                "report_date": report_date,
+                "submitted_at": now_iso(),
+                "return_to_hq": False,
+                "user": {
+                    "employee_id": senior_id,
+                    "name": person.get("name"),
+                    "role": person.get("role"),
+                    "territory": person.get("territory"),
+                    "hq": person.get("territory") or "",
+                    "designation": person.get("designation") or "",
+                    "profile_image_url": person.get("profile_image_url") or "",
+                },
+                "stations": [],
+                "selected_areas": field_areas,
+                "doctors": copied_docs,
+                "parties": copied_parties,
+                "cme_other": [],
+                "metadata": {
+                    "source": "joint_working_sync",
+                    "joint_with_employee_id": submitter_id,
+                    "joint_with_dpr_id": source_dpr_id,
+                },
+                "joint_working": True,
+                "joint_working_seniors": [
+                    {"id": submitter_id, "name": submitter_name, "role": ""},
+                ],
+            }
+            summary = (
+                f"Joint working DPR {report_date} — {len(copied_docs)} doctor(s) — "
+                f"{len(copied_parties)} party visit(s)"
+            )
+            await db.insert(
+                "dpr_reports",
+                {
+                    "dpr_id": dpr_id,
+                    "employee_id": senior_id,
+                    "report_date": report_date,
+                    "submitted_time": clock_label(),
+                    "status": "pending",
+                    "sla": "24h",
+                    "details": summary,
+                    "doctor_calls": len(copied_docs),
+                    "chemist_visits": len(copied_parties),
+                    "return_to_hq": False,
+                    "selected_areas": field_areas,
+                    "payload": payload,
+                },
+            )
+            await _append_dpr_visit_rows(db, dpr_id, copied_docs, copied_parties, 1)
+
+        await notify_dpr_joint_working_tagged(
+            db,
+            submitter_id=submitter_id,
+            submitter_name=submitter_name,
+            senior_employee_id=senior_id,
+            dpr_id=source_dpr_id,
+            report_date=str(report_date),
+            visit_count=len(copied_docs) + len(copied_parties),
+        )
+
+
 def _dpr_field_areas(body: dict) -> list:
     blocks = _dpr_field_blocks(body)
     if blocks:
@@ -1373,8 +1609,11 @@ async def submit_dpr(body: dict = Body(...), user: dict = Depends(field_user), d
         "parties": parties,
         "cme_other": cme_other,
         "metadata": body.get("metadata") or {},
-        "joint_working_seniors": body.get("joint_working_seniors") or [],
+        "joint_working": bool(body.get("joint_working")),
+        "joint_working_seniors": _extract_joint_working_seniors(body),
     }
+    if payload["joint_working_seniors"]:
+        payload["joint_working"] = True
     row = {
         "employee_id": employee_id,
         "report_date": report_date,
@@ -1417,18 +1656,32 @@ async def submit_dpr(body: dict = Body(...), user: dict = Depends(field_user), d
         await db.insert("dpr_visit_details", visit_rows)
     payload["dpr_id"] = dpr_id
 
+    submitter_name = str(person.get("name") or employee_id)
     manager_fields = await _manager_fields_for_tour_submit(db, employee_id, body)
     manager_id = str(manager_fields.get("forwarded_to") or "").strip()
-    if manager_id:
-        submitter_name = str(person.get("name") or employee_id)
-        await notify_dpr_submitted_to_manager(
-            db,
-            submitter_id=employee_id,
-            submitter_name=submitter_name,
-            manager_employee_id=manager_id,
-            dpr_id=dpr_id,
-            report_date=str(report_date),
-        )
+    seniors = await _senior_employee_ids_for_notify(db, employee_id)
+    notify_ids = list(seniors)
+    if manager_id and manager_id not in notify_ids:
+        notify_ids.insert(0, manager_id)
+    if not notify_ids and manager_id:
+        notify_ids = [manager_id]
+    await notify_dpr_submitted_to_seniors(
+        db,
+        submitter_id=employee_id,
+        submitter_name=submitter_name,
+        senior_employee_ids=notify_ids,
+        dpr_id=dpr_id,
+        report_date=str(report_date),
+    )
+
+    await _sync_joint_working_to_senior_dprs(
+        db,
+        submitter_id=employee_id,
+        submitter_name=submitter_name,
+        report_date=str(report_date),
+        source_dpr_id=dpr_id,
+        body=body,
+    )
 
     return respond("DPR submitted", payload, 201)
 

@@ -159,6 +159,71 @@ async def notify_dpr_submitted_to_manager(
     )
 
 
+async def notify_dpr_submitted_to_seniors(
+    db: DB,
+    *,
+    submitter_id: str,
+    submitter_name: str,
+    senior_employee_ids: list[str],
+    dpr_id: str,
+    report_date: str,
+) -> None:
+    """Alert reporting-chain managers when a DPR is submitted or updated."""
+    if not senior_employee_ids:
+        return
+    title = "DPR submitted for review"
+    description = f"{submitter_name} submitted a DPR for {report_date}."
+    for senior_id in senior_employee_ids:
+        sid = str(senior_id or "").strip()
+        if not sid or sid == submitter_id:
+            continue
+        await create_user_notification(
+            db,
+            employee_id=sid,
+            title=title,
+            description=description,
+            notification_type="report",
+            reference_type="dpr",
+            reference_id=dpr_id,
+            action_url="/notifications",
+            notification_id=_safe_notification_id(f"dpr_submit_{sid}", dpr_id),
+        )
+
+
+async def notify_dpr_joint_working_tagged(
+    db: DB,
+    *,
+    submitter_id: str,
+    submitter_name: str,
+    senior_employee_id: str,
+    dpr_id: str,
+    report_date: str,
+    visit_count: int,
+) -> None:
+    if not senior_employee_id or senior_employee_id == submitter_id:
+        return
+    title = "Joint working DPR"
+    visits = f"{visit_count} visit{'s' if visit_count != 1 else ''}"
+    description = (
+        f"{submitter_name} tagged you in joint working on {report_date} "
+        f"({visits}). Your DPR was updated."
+    )
+    await create_user_notification(
+        db,
+        employee_id=senior_employee_id,
+        title=title,
+        description=description,
+        notification_type="report",
+        reference_type="dpr",
+        reference_id=dpr_id,
+        action_url="/notifications",
+        notification_id=_safe_notification_id(
+            f"dpr_jw_{senior_employee_id}",
+            dpr_id,
+        ),
+    )
+
+
 async def notify_tour_submitted_to_manager(
     db: DB,
     *,
