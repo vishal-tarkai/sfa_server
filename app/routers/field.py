@@ -437,6 +437,34 @@ async def _assigned_areas(db: DB, employee_id: str) -> list[dict]:
     return [area_card(node) for node in _assigned_area_nodes(user, nodes)]
 
 
+def _expense_month_key(claim_date: str | None) -> str:
+    """yyyy-MM for monthly expense grouping."""
+    raw = as_date(claim_date) or str(claim_date or "").strip()
+    if len(raw) >= 7 and raw[4] == "-":
+        return raw[:7]
+    return date.today().strftime("%Y-%m")
+
+
+def _expense_month_anchor(claim_date: str | None) -> str:
+    """Store claims on the first day of the month."""
+    return f"{_expense_month_key(claim_date)}-01"
+
+
+async def _expense_claim_for_employee_month(
+    db: DB, employee_id: str, month_key: str
+) -> dict | None:
+    start, end = month_bounds(month_key)
+    rows = await db.select(
+        "expense_claims",
+        filters={"employee_id": employee_id},
+        order="claim_date.desc",
+    )
+    for row in rows:
+        if in_month(row.get("claim_date"), start, end):
+            return row
+    return None
+
+
 def _claim(row: dict, name: str = "") -> dict:
     return {
         "claim_id": row.get("claim_id"),
@@ -1274,6 +1302,20 @@ def _dpr_payload_dict(row: dict) -> dict:
     return {}
 
 
+def _dpr_effective_status(row: dict) -> str:
+    """Row status wins; fall back to payload for legacy admin updates."""
+    payload = _dpr_payload_dict(row)
+    candidates = [
+        str(row.get("status") or "").strip().lower(),
+        str(payload.get("status") or "").strip().lower(),
+    ]
+    if "approved" in candidates:
+        return "approved"
+    if "rejected" in candidates:
+        return "rejected"
+    return "pending"
+
+
 def _dpr_list_item(row: dict, names: dict[str, dict]) -> dict:
     person = names.get(row.get("employee_id")) or {}
     payload = _dpr_payload_dict(row)
@@ -1294,7 +1336,7 @@ def _dpr_list_item(row: dict, names: dict[str, dict]) -> dict:
         "territory": person.get("territory") or "",
         "location": location,
         "profile_image_url": person.get("profile_image_url") or "",
-        "status": row.get("status") or "pending",
+        "status": _dpr_effective_status(row),
         "visit_count": int(num(row.get("doctor_calls")))
         + int(num(row.get("chemist_visits")))
         or (len(doctors) + len(parties) + len(cme)),
@@ -1579,6 +1621,8 @@ async def submit_dpr(body: dict = Body(...), user: dict = Depends(field_user), d
     person = await _user_row(db, employee_id)
     report_date = body.get("report_date") or today_str()
     existing = await db.select("dpr_reports", filters={"employee_id": employee_id, "report_date": report_date}, limit=1)
+    if existing and _dpr_effective_status(existing[0]) == "approved":
+        raise APIError(409, "Approved DPR cannot be changed", "DPR_ALREADY_APPROVED")
     dpr_id = (existing[0].get("dpr_id") if existing else None) or body.get("dpr_id") or new_id("DPR")
     doctors, parties, cme_other = _dpr_flat_visits(body)
     field_areas = _dpr_field_areas(body)
@@ -1732,7 +1776,7 @@ async def _dpr_detail(db: DB, dpr_id: str) -> dict:
     visits = await db.select("dpr_visit_details", filters={"dpr_id": dpr_id}, order="sort_order.asc")
     return {
         "dpr_id": dpr_id,
-        "status": row.get("status") or "pending",
+        "status": _dpr_effective_status(row),
         "report_date": as_date(row.get("report_date")),
         "employee": {
             "employee_id": row.get("employee_id"),
@@ -1785,9 +1829,12 @@ async def _set_dpr_status(db: DB, dpr_id: str, status: str, note: str = "") -> d
     prior_status = str(row.get("status") or "pending")
     if status == "approved" and prior_status == "approved":
         raise APIError(409, "DPR is already approved", "DPR_ALREADY_APPROVED")
-    updates = {"status": status}
+    updates: dict[str, Any] = {"status": status}
     if note:
         updates["review_note"] = note
+    payload = _dpr_payload_dict(row)
+    if payload:
+        updates["payload"] = {**payload, "status": status}
     await db.update("dpr_reports", updates, {"dpr_id": dpr_id})
 
     if prior_status == "pending" and status in ("approved", "rejected"):
@@ -2998,17 +3045,35 @@ async def list_expenses(user: dict = Depends(field_user), db: DB = Depends(get_d
     return respond("OK", {"items": [_claim(row) for row in rows]})
 
 
+@router.get("/expenses/by-month/{month}")
+async def expense_by_month(month: str, user: dict = Depends(field_user), db: DB = Depends(get_db)):
+    row = await _expense_claim_for_employee_month(db, user["employee_id"], month)
+    return respond("OK", None if not row else _claim(row))
+
+
 @router.get("/expenses/by-date/{claim_date}")
 async def expense_by_date(claim_date: str, user: dict = Depends(field_user), db: DB = Depends(get_db)):
-    rows = await db.select("expense_claims", filters={"employee_id": user["employee_id"], "claim_date": claim_date}, limit=1)
-    return respond("OK", None if not rows else _claim(rows[0]))
+    """Legacy path — resolves the claim for that calendar month."""
+    row = await _expense_claim_for_employee_month(
+        db, user["employee_id"], _expense_month_key(claim_date)
+    )
+    return respond("OK", None if not row else _claim(row))
 
 
 @router.post("/expenses")
 async def submit_expense(body: dict = Body(...), user: dict = Depends(field_user), db: DB = Depends(get_db)):
-    claim_date = body.get("claim_date") or today_str()
-    existing = await db.select("expense_claims", filters={"employee_id": user["employee_id"], "claim_date": claim_date}, limit=1)
-    if existing and existing[0].get("status") == "approved":
+    claim_date = _expense_month_anchor(body.get("claim_date") or today_str())
+    month_key = _expense_month_key(claim_date)
+    claim_id_body = str(body.get("claim_id") or "").strip()
+    existing = None
+    if claim_id_body:
+        rows = await db.select("expense_claims", filters={"claim_id": claim_id_body}, limit=1)
+        existing = rows[0] if rows else None
+    if existing is None:
+        existing = await _expense_claim_for_employee_month(
+            db, user["employee_id"], month_key
+        )
+    if existing and existing.get("status") == "approved":
         raise APIError(409, "Approved claims cannot be edited", "CLAIM_LOCKED")
     misc = num(body.get("miscellaneous"))
     phone = num(body.get("phone_allowance"))
@@ -3037,7 +3102,7 @@ async def submit_expense(body: dict = Body(...), user: dict = Depends(field_user
         "updated_at": now_iso(),
     }
     if existing:
-        claim_id = existing[0].get("claim_id")
+        claim_id = existing.get("claim_id")
         await db.update("expense_claims", payload, {"claim_id": claim_id})
     else:
         claim_id = body.get("claim_id") or new_id("EXP")
