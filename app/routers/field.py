@@ -2841,6 +2841,25 @@ def _leave_remaining(balance: dict, leave_type: str) -> float:
     return num(balance.get(column))
 
 
+def _leave_days_db(days: float) -> int:
+    """`approval_requests.leave_days` is INTEGER in Postgres."""
+    d = float(days)
+    if d <= 0:
+        return 1
+    rounded = round(d)
+    if abs(d - rounded) < 1e-9:
+        return int(rounded)
+    return max(1, int(rounded))
+
+
+def _leave_days_effective(row: dict) -> float:
+    days = float(num(row.get("leave_days")))
+    duration = str(row.get("duration") or "full_day").strip().lower()
+    if duration in ("first_half", "second_half"):
+        return days * 0.5
+    return days
+
+
 async def _balance(db: DB, employee_id: str) -> dict:
     rows = await db.select("leave_balances", filters={"employee_id": employee_id}, limit=1)
     if not rows:
@@ -2884,9 +2903,13 @@ async def apply_leave(body: dict = Body(...), user: dict = Depends(field_user), 
     leave_type = body.get("leave_type") or "casual_leave"
     start = body.get("from_date") or today_str()
     end = body.get("to_date") or start
+    duration = str(body.get("duration") or "full_day").strip().lower()
+    span = float((date.fromisoformat(end) - date.fromisoformat(start)).days + 1)
     days = num(body.get("days"))
     if days <= 0:
-        days = float((date.fromisoformat(end) - date.fromisoformat(start)).days + 1)
+        days = span * (0.5 if duration in ("first_half", "second_half") else 1.0)
+    elif duration in ("first_half", "second_half") and days >= span:
+        days = span * 0.5
     balance = await _balance(db, user["employee_id"])
     column = _leave_balance_column(leave_type)
     remaining = _leave_remaining(balance, leave_type)
@@ -2917,7 +2940,8 @@ async def apply_leave(body: dict = Body(...), user: dict = Depends(field_user), 
         "details": f"{leave_type} · {body.get('reason') or ''}",
         "leave_from": start,
         "leave_to": end,
-        "leave_days": days,
+        "leave_days": _leave_days_db(span),
+        "duration": duration,
         "leave_reason": body.get("reason") or "",
         "leave_type": leave_type,
         "applied_at": now_iso(),
@@ -2974,7 +2998,7 @@ async def _review_leave(db: DB, approval_id: str, status: str, note: str = "") -
         leave_type = row.get("leave_type") or "casual_leave"
         balance_col = _leave_balance_column(leave_type)
         used_col = f"{balance_col}_used"
-        days = num(row.get("leave_days"))
+        days = _leave_days_effective(row)
         balance = await _balance(db, row.get("employee_id"))
         remaining = num(balance.get(balance_col))
         used = num(balance.get(used_col))
