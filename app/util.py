@@ -35,6 +35,42 @@ def today_str() -> str:
     return local_now().date().isoformat()
 
 
+_CELEBRATION_DATE_FORMATS = (
+    "%d %b %Y",
+    "%d %B %Y",
+    "%Y-%m-%d",
+    "%d/%m/%Y",
+    "%d-%m-%Y",
+)
+
+
+def parse_celebration_calendar_date(value: Any) -> date | None:
+    """Parse healthcare entity dob/anniversary (see migration 021: dd MMM yyyy)."""
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if len(text) >= 10 and text[4] == "-" and text[7] == "-":
+        try:
+            return date.fromisoformat(text[:10])
+        except ValueError:
+            pass
+    for fmt in _CELEBRATION_DATE_FORMATS:
+        try:
+            return datetime.strptime(text, fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+def celebration_matches_today(value: Any, on: date | None = None) -> bool:
+    """True when month/day of [value] match [on] (default: today in field timezone)."""
+    parsed = parse_celebration_calendar_date(value)
+    if parsed is None:
+        return False
+    on = on or local_now().date()
+    return parsed.month == on.month and parsed.day == on.day
+
+
 def parse_iso_datetime(value: Any) -> datetime | None:
     if value is None or value == "":
         return None

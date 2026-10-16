@@ -38,8 +38,10 @@ from app.util import (
     area_card,
     as_date,
     attendance_display_time,
+    celebration_matches_today,
     clock_label,
     coerce_text_list,
+    local_now,
     pick_clock_label,
     entity_card,
     entity_visible_for_territory,
@@ -816,22 +818,21 @@ async def proximity(
 
 
 async def _celebration_items(db: DB) -> list[dict]:
-    today = date.today()
-    key = today.strftime("%m-%d")
+    today = local_now().date()
     rows = await db.select("healthcare_entities", filters={"status": "active"})
     items = []
     for row in rows:
         for field, occasion in (("dob", "birthday"), ("anniversary", "anniversary")):
-            raw = str(row.get(field) or "")
-            if len(raw) >= 10 and raw[5:10] == key:
-                items.append({
-                    "entity_id": row.get("entity_id"),
-                    "name": row.get("name"),
-                    "type": row.get("type"),
-                    "occasion": occasion,
-                    "hospital": row.get("hospital") or "",
-                    "phone": row.get("phone") or "",
-                })
+            if not celebration_matches_today(row.get(field), today):
+                continue
+            items.append({
+                "entity_id": row.get("entity_id"),
+                "name": row.get("name"),
+                "type": row.get("type"),
+                "occasion": occasion,
+                "hospital": row.get("hospital") or "",
+                "phone": row.get("phone") or "",
+            })
     return items
 
 
