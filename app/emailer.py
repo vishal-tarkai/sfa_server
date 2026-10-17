@@ -66,7 +66,12 @@ def send_via_resend_sync(to: str, subject: str, text_body: str, html_body: str |
     if response.status_code >= 400:
         detail = response.text[:400]
         logger.error("Resend failed %s: %s", response.status_code, detail)
-        raise RuntimeError("Could not send reset email")
+        try:
+            err = response.json()
+            message = err.get("message") if isinstance(err, dict) else None
+        except Exception:
+            message = None
+        raise RuntimeError(message or "Could not send reset email")
 
 
 def send_email_sync(to: str, subject: str, text_body: str, html_body: str | None = None) -> None:

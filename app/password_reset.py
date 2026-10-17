@@ -85,13 +85,24 @@ async def request_password_reset(db: DB, email: str) -> None:
 
     if email_delivery_configured():
         name = str(user.get("name") or "")
-        await asyncio.to_thread(
-            send_password_reset_email,
-            normalized,
-            name,
-            code,
-            PASSWORD_RESET_TTL_MINUTES,
-        )
+        try:
+            await asyncio.to_thread(
+                send_password_reset_email,
+                normalized,
+                name,
+                code,
+                PASSWORD_RESET_TTL_MINUTES,
+            )
+        except Exception as exc:
+            logger.exception("Password reset email failed for %s", normalized)
+            await _invalidate_pending(db, employee_id)
+            raise APIError(
+                502,
+                "Could not send the reset email. If you use Resend test mode, "
+                "the address must match your Resend account or a verified domain.",
+                "EMAIL_SEND_FAILED",
+                {"email": ["Could not send reset email. Try again or contact support."]},
+            ) from exc
     elif PASSWORD_RESET_DEV_LOG:
         logger.warning(
             "PASSWORD_RESET_DEV_LOG: reset code for %s (%s) is %s",
