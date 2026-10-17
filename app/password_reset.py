@@ -96,12 +96,15 @@ async def request_password_reset(db: DB, email: str) -> None:
         except Exception as exc:
             logger.exception("Password reset email failed for %s", normalized)
             await _invalidate_pending(db, employee_id)
+            detail = str(exc).strip() or (
+                "Could not send the reset email. Verify your domain in Resend "
+                "or use the email address on your Resend account for testing."
+            )
             raise APIError(
                 502,
-                "Could not send the reset email. If you use Resend test mode, "
-                "the address must match your Resend account or a verified domain.",
+                detail,
                 "EMAIL_SEND_FAILED",
-                {"email": ["Could not send reset email. Try again or contact support."]},
+                {"email": [detail]},
             ) from exc
     elif PASSWORD_RESET_DEV_LOG:
         logger.warning(
