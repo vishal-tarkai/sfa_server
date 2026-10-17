@@ -11,7 +11,7 @@ from datetime import datetime, timedelta, timezone
 
 from app.config import PASSWORD_RESET_DEV_LOG, PASSWORD_RESET_PEPPER, PASSWORD_RESET_TTL_MINUTES
 from app.db import DB
-from app.emailer import send_password_reset_email, smtp_configured
+from app.emailer import email_delivery_configured, send_password_reset_email
 from app.errors import APIError
 
 logger = logging.getLogger(__name__)
@@ -83,7 +83,7 @@ async def request_password_reset(db: DB, email: str) -> None:
         },
     )
 
-    if smtp_configured():
+    if email_delivery_configured():
         name = str(user.get("name") or "")
         await asyncio.to_thread(
             send_password_reset_email,
@@ -102,7 +102,7 @@ async def request_password_reset(db: DB, email: str) -> None:
     else:
         raise APIError(
             503,
-            "Password reset email is not configured. Contact your administrator.",
+            "Email sending is not configured on the server.",
             "SERVICE_UNAVAILABLE",
         )
 

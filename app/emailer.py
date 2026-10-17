@@ -1,4 +1,4 @@
-"""Transactional email (SMTP). Configure via SMTP_* env vars."""
+"""Transactional email — SMTP or Resend (RESEND_API_KEY)."""
 
 from __future__ import annotations
 
@@ -7,7 +7,11 @@ import smtplib
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
+import httpx
+
 from app.config import (
+    RESEND_API_KEY,
+    RESEND_FROM,
     SMTP_FROM,
     SMTP_HOST,
     SMTP_PASSWORD,
@@ -21,6 +25,45 @@ logger = logging.getLogger(__name__)
 
 def smtp_configured() -> bool:
     return bool(SMTP_HOST and SMTP_FROM)
+
+
+def resend_configured() -> bool:
+    return bool(RESEND_API_KEY and (RESEND_FROM or SMTP_FROM))
+
+
+def email_delivery_configured() -> bool:
+    return smtp_configured() or resend_configured()
+
+
+def _from_address() -> str:
+    return (RESEND_FROM or SMTP_FROM or "").strip()
+
+
+def send_via_resend_sync(to: str, subject: str, text_body: str, html_body: str | None) -> None:
+    from_addr = _from_address()
+    if not RESEND_API_KEY or not from_addr:
+        raise RuntimeError("Resend is not configured")
+    payload = {
+        "from": from_addr,
+        "to": [to],
+        "subject": subject,
+        "text": text_body,
+    }
+    if html_body:
+        payload["html"] = html_body
+    response = httpx.post(
+        "https://api.resend.com/emails",
+        headers={
+            "Authorization": f"Bearer {RESEND_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        json=payload,
+        timeout=30.0,
+    )
+    if response.status_code >= 400:
+        detail = response.text[:400]
+        logger.error("Resend failed %s: %s", response.status_code, detail)
+        raise RuntimeError("Could not send reset email")
 
 
 def send_email_sync(to: str, subject: str, text_body: str, html_body: str | None = None) -> None:
@@ -69,4 +112,7 @@ def send_password_reset_email(to: str, user_name: str, code: str, minutes_valid:
         f"<p>Open the CMS app, go to <em>Forgot Password</em>, and enter this code with your new password.</p>"
         f"<p>If you did not request this, you can ignore this email.</p>"
     )
-    send_email_sync(to, subject, text, html)
+    if resend_configured():
+        send_via_resend_sync(to, subject, text, html)
+    else:
+        send_email_sync(to, subject, text, html)
