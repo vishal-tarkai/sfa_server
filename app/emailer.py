@@ -22,13 +22,16 @@ from app.config import (
 
 logger = logging.getLogger(__name__)
 
+# Resend test sender until a domain is verified in the Resend dashboard.
+DEFAULT_RESEND_FROM = "CMS <onboarding@resend.dev>"
+
 
 def smtp_configured() -> bool:
     return bool(SMTP_HOST and SMTP_FROM)
 
 
 def resend_configured() -> bool:
-    return bool(RESEND_API_KEY and (RESEND_FROM or SMTP_FROM))
+    return bool((RESEND_API_KEY or "").strip())
 
 
 def email_delivery_configured() -> bool:
@@ -36,7 +39,7 @@ def email_delivery_configured() -> bool:
 
 
 def _from_address() -> str:
-    return (RESEND_FROM or SMTP_FROM or "").strip()
+    return (RESEND_FROM or SMTP_FROM or DEFAULT_RESEND_FROM).strip()
 
 
 def send_via_resend_sync(to: str, subject: str, text_body: str, html_body: str | None) -> None:

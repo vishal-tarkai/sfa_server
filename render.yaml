@@ -21,3 +21,8 @@ services:
         value: "500"
       - key: ATTENDANCE_SKIP_GEOFENCE
         value: "true"
+      # CMS forgot-password — set RESEND_API_KEY in Render dashboard (Secret).
+      - key: RESEND_API_KEY
+        sync: false
+      - key: RESEND_FROM
+        value: "CMS <onboarding@resend.dev>"

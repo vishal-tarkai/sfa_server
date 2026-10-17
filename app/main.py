@@ -18,6 +18,7 @@ from fastapi.responses import JSONResponse, RedirectResponse
 import os
 
 from app.config import supabase_credentials
+from app.emailer import email_delivery_configured
 from app.db import create_db
 from app.errors import APIError, fail_body
 from app.routers.admin import router as admin_router
@@ -113,6 +114,7 @@ async def health(request: Request) -> dict:
     configured = db.configured if db is not None else False
     data: dict = {
         "configured": configured,
+        "password_reset_email_ready": email_delivery_configured(),
         "docs": "/docs",
         "swagger": "/swagger",
         "redoc": "/redoc",
