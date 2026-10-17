@@ -22,6 +22,7 @@ from app.config import (
 from app.db import DB
 from app.deps import get_db
 from app.errors import APIError, respond
+from app.password_reset import complete_password_reset, request_password_reset
 from app.notifications import (
     notify_dpr_joint_working_tagged,
     notify_dpr_reviewed_to_employee,
@@ -581,6 +582,22 @@ async def login(
 async def logout(user: dict = Depends(field_user)):
     drop_token(user.get("token"))
     return respond("Logged out successfully", None)
+
+
+@router.post("/auth/forgot-password")
+async def forgot_password(body: dict = Body(...), db: DB = Depends(get_db)):
+    email = str(body.get("email") or "")
+    await request_password_reset(db, email)
+    return respond("Reset code sent to your email.", None)
+
+
+@router.post("/auth/reset-password")
+async def reset_password(body: dict = Body(...), db: DB = Depends(get_db)):
+    email = str(body.get("email") or "")
+    code = str(body.get("code") or body.get("token") or "")
+    password = str(body.get("password") or body.get("new_password") or "")
+    await complete_password_reset(db, email, code, password)
+    return respond("Password updated. You can sign in with your new password.", None)
 
 
 async def _persist_fcm_token(
