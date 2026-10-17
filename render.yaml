@@ -21,7 +21,11 @@ services:
         value: "500"
       - key: ATTENDANCE_SKIP_GEOFENCE
         value: "true"
-      # CMS forgot-password — set RESEND_API_KEY in Render dashboard (Secret).
+      # CMS forgot-password — set SENDGRID_API_KEY in Render (Secret). Sender must be verified in SendGrid.
+      - key: SENDGRID_API_KEY
+        sync: false
+      - key: SENDGRID_FROM
+        value: "Cms <noreply@tarkai.com>"
       - key: RESEND_API_KEY
         sync: false
       - key: RESEND_FROM
